@@ -1,35 +1,33 @@
 #!/usr/bin/env python3
 """
-Reentry/TIP Monitoring Pipeline + Dummy Test + Flask Viewer (Map + Ground Track)
+Reentry/TIP Monitoring Pipeline + Dummy Test
+✅ Sends a WORKFLOW CARD (Adaptive Card) via Microsoft Teams Workflows / Power Automate
+✅ Includes a CLICKABLE LINK to your Streamlit viewer:
+    VIEWER_BASE_URL/?event_id=<event_id>
 
-Adds:
-- Event JSON stores ground-track points (downsampled)
-- Flask viewer shows Leaflet map with:
-  - Ground track polyline
-  - Hit marker
-  - PH bbox rectangle
+IMPORTANT:
+- For a Workflow card, TEAMS_WEBHOOK_URL must be a *Workflows / Power Automate HTTP trigger* URL
+  (usually contains: logic.azure.com / powerautomate / flow.microsoft.com)
+- If TEAMS_WEBHOOK_URL is an Incoming Webhook (outlook.office.com/webhook/...), you will only get a plain message.
 
-Requirements:
-  pip install requests skyfield python-dotenv numpy flask
-
-Env vars (optional):
-  SPACE_TRACK_USERNAME
-  SPACE_TRACK_PASSWORD
-  TEAMS_WEBHOOK_URL
-  BASE_URL
+Env vars (.env):
+  SPACE_TRACK_USERNAME=
+  SPACE_TRACK_PASSWORD=
   NORAD_IDS=66877,12345
+  TEAMS_WEBHOOK_URL=...  # Workflows trigger URL for cards (recommended)
+  VIEWER_BASE_URL=https://smcod-ssa.streamlit.app
+  OUT_DIR=./reentry_alerts
+
+Optional tuning:
   POLL_SECONDS=600
   PH_NEAR_KM=500
   WINDOW_BEFORE_MIN=120
   WINDOW_AFTER_MIN=120
   STEP_SECONDS=30
   FALLBACK_UNCERT_MIN=48
-  OUT_DIR=./reentry_alerts
-  FLASK_HOST=0.0.0.0
-  FLASK_PORT=8080
+  TRACK_MAX_POINTS=300
 
 Usage:
-  python monitoring.py serve
   python monitoring.py dummy-page
   python monitoring.py dummy-alert
   python monitoring.py monitor
@@ -51,9 +49,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import requests
 from dotenv import load_dotenv
-
-from flask import Flask, abort, Response
-
 from skyfield.api import EarthSatellite, load as sf_load
 
 # -----------------------------
@@ -66,7 +61,7 @@ LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
 PH_TZ = dt.timezone(dt.timedelta(hours=8))
 EARTH_RADIUS_KM = 6371.0088
 
-# Operational PH bbox (quick filter) — adjust if you want broader PAR
+# PH bbox quick filter (adjust if you want PAR instead)
 PH_BBOX = {"lon_min": 115.0, "lon_max": 130.0, "lat_min": 4.0, "lat_max": 22.0}
 
 OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts")
@@ -75,11 +70,12 @@ STATE_PATH = os.path.join(OUT_DIR, "state.json")
 SPACE_TRACK_USERNAME = os.getenv("SPACE_TRACK_USERNAME", "").strip()
 SPACE_TRACK_PASSWORD = os.getenv("SPACE_TRACK_PASSWORD", "").strip()
 
+# You said you already have this in .env:
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
-BASE_URL = os.getenv("BASE_URL", "").strip()  # for Teams clickable links
+
+VIEWER_BASE_URL = os.getenv("VIEWER_BASE_URL", "").strip()  # Streamlit base URL
 
 DEFAULT_TIP_LIMIT = int(os.getenv("TIP_LIMIT", "200"))
-
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "600"))
 PH_NEAR_KM = float(os.getenv("PH_NEAR_KM", "500"))
 
@@ -88,11 +84,7 @@ WINDOW_AFTER_MIN = int(os.getenv("WINDOW_AFTER_MIN", "120"))
 STEP_SECONDS = int(os.getenv("STEP_SECONDS", "30"))
 FALLBACK_UNCERT_MIN = float(os.getenv("FALLBACK_UNCERT_MIN", "48"))
 
-FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
-FLASK_PORT = int(os.getenv("FLASK_PORT", "8080"))
-
-# For storing track in event JSON (to keep files small)
-TRACK_MAX_POINTS = int(os.getenv("TRACK_MAX_POINTS", "300"))  # downsample to <= this many points
+TRACK_MAX_POINTS = int(os.getenv("TRACK_MAX_POINTS", "300"))
 
 NORAD_IDS: List[int] = []
 raw_ids = os.getenv("NORAD_IDS", "").strip()
@@ -197,7 +189,6 @@ def downsample_track(track: List[Dict[str, Any]], max_points: int) -> List[Dict[
         return track
     step = max(1, int(math.ceil(len(track) / float(max_points))))
     out = track[::step]
-    # ensure last point included
     if out and out[-1] is not track[-1]:
         out.append(track[-1])
     return out
@@ -445,37 +436,72 @@ def write_event(out_dir: str, event_id: str, event: Dict[str, Any]) -> str:
 
 
 # -----------------------------
-# Teams alerting
+# Viewer link
 # -----------------------------
-def teams_post(webhook_url: str, title: str, text: str) -> None:
-    if not webhook_url:
+def streamlit_event_link(event_id: str) -> str:
+    if not VIEWER_BASE_URL:
+        return ""
+    base = VIEWER_BASE_URL.rstrip("/")
+    return f"{base}/?event_id={event_id}"
+
+
+# -----------------------------
+# Teams posting
+# -----------------------------
+def _is_workflow_url(url: str) -> bool:
+    u = (url or "").lower()
+    return ("logic.azure.com" in u) or ("powerautomate" in u) or ("flow.microsoft" in u) or ("logic-" in u)
+
+
+def teams_send(event_id: str, event: Dict[str, Any]) -> None:
+    """
+    If TEAMS_WEBHOOK_URL is a Workflows/Power Automate trigger URL:
+      -> send JSON payload for your workflow to build an Adaptive Card (Workflow card)
+    If it's an Incoming Webhook:
+      -> fallback to plain message
+    """
+    if not TEAMS_WEBHOOK_URL:
         return
-    payload = {"text": f"**{title}**\n\n{text}"}
-    r = requests.post(webhook_url, json=payload, timeout=20)
-    r.raise_for_status()
 
+    link = streamlit_event_link(event_id)
 
-def format_alert(event_id: str, event: Dict[str, Any]) -> Tuple[str, str]:
-    norad = event.get("norad_id", "N/A")
-    name = event.get("object_name", f"NORAD {norad}")
-    hit = event.get("hit", {})
-    w = event.get("decay_window", {})
-    pf = event.get("ph_filter", {})
+    payload = {
+        "event_id": event_id,
+        "viewer_url": link,
+        "norad_id": event.get("norad_id"),
+        "object_name": event.get("object_name"),
+        "tip_msg_epoch_used": event.get("tip_msg_epoch_used"),
+        "window_start_utc": event.get("decay_window", {}).get("start_utc"),
+        "window_end_utc": event.get("decay_window", {}).get("end_utc"),
+        "window_mode": event.get("decay_window", {}).get("mode"),
+        "hit_type": event.get("hit", {}).get("type"),
+        "hit_time_utc": event.get("hit", {}).get("time_utc"),
+        "hit_time_ph": event.get("hit", {}).get("time_ph"),
+        "hit_lat": event.get("hit", {}).get("lat"),
+        "hit_lon": event.get("hit", {}).get("lon"),
+        "distance_to_ph_bbox_km": event.get("hit", {}).get("distance_to_ph_bbox_km"),
+        "near_threshold_km": event.get("ph_filter", {}).get("near_km_threshold"),
+    }
 
-    link_line = ""
-    if BASE_URL:
-        link_line = f"\n🔗 View details:\n{BASE_URL.rstrip('/')}/event/{event_id}\n"
+    if _is_workflow_url(TEAMS_WEBHOOK_URL):
+        # ✅ Workflows / Power Automate: send JSON, workflow creates the card
+        r = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=25)
+        r.raise_for_status()
+        return
 
-    title = f"Reentry/TIP Alert — {hit.get('type','')} — {name} (NORAD {norad})"
+    # Fallback: Incoming Webhook (plain text only)
+    title = f"Reentry/TIP Alert — {payload.get('hit_type')} — {payload.get('object_name')} (NORAD {payload.get('norad_id')})"
     text = (
-        f"- TIP MSG_EPOCH: {event.get('tip_msg_epoch_used','')}\n"
-        f"- Decay window (UTC): {w.get('start_utc','')} → {w.get('end_utc','')} (mode={w.get('mode','')})\n"
-        f"- Closest approach: {pf.get('min_distance_time_utc','')} | {pf.get('min_distance_time_ph','')}\n"
-        f"- Hit location: lat={hit.get('lat',0):.3f}, lon={hit.get('lon',0):.3f}\n"
-        f"- Distance to PH bbox: {hit.get('distance_to_ph_bbox_km',0):.0f} km (near threshold={pf.get('near_km_threshold',PH_NEAR_KM):.0f} km)\n"
-        f"{link_line}"
+        f"- Window (UTC): {payload.get('window_start_utc')} → {payload.get('window_end_utc')} (mode={payload.get('window_mode')})\n"
+        f"- Hit: {payload.get('hit_time_utc')} | {payload.get('hit_time_ph')}\n"
+        f"- Location: lat={payload.get('hit_lat')}, lon={payload.get('hit_lon')}\n"
+        f"- Dist to PH bbox: {payload.get('distance_to_ph_bbox_km')} km (threshold={payload.get('near_threshold_km')} km)\n"
     )
-    return title, text
+    if link:
+        text += f"\nView details:\n{link}\n"
+
+    r = requests.post(TEAMS_WEBHOOK_URL, json={"text": f"**{title}**\n\n{text}"}, timeout=25)
+    r.raise_for_status()
 
 
 # -----------------------------
@@ -497,7 +523,7 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
 
     wmin, wmax, mode = compute_tip_window_from_latest_batch(latest_batch, FALLBACK_UNCERT_MIN)
 
-    # update seen (so we don't spam)
+    # update seen (avoid spam)
     state.setdefault("last_msg_epoch", {})[str(norad_id)] = latest_msg_epoch
 
     if not (wmin and wmax):
@@ -510,7 +536,7 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
     t_center = wmin + (wmax - wmin) / 2
     lats, lons, times_dt = groundtrack_corridor(sat, t_center, WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN, STEP_SECONDS)
 
-    # build track list for saving + map
+    # Save track for Streamlit viewer
     track = []
     for lat, lon, tt in zip(lats, lons, times_dt):
         track.append({"time_utc": dt_to_iso_z(tt), "lat": float(lat), "lon": float(lon)})
@@ -586,25 +612,25 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
             "lon": float(lons[idx]),
             "distance_to_ph_bbox_km": float(distance_to_bbox_km(float(lats[idx]), float(lons[idx]), PH_BBOX)),
         },
-        "track": track,  # ✅ used by Flask map
+        "track": track,
     }
 
     return event_id, event
 
 
 # -----------------------------
-# Dummy event generators (with fake track)
+# Dummy events (for testing Teams + Streamlit)
 # -----------------------------
 def create_dummy_event(event_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     t = now_utc()
     if event_id is None:
         event_id = f"dummy_66877_{t.strftime('%Y%m%d_%H%M%S')}"
 
-    # Fake track: from Palawan-ish across Luzon then out
+    # Fake track across PH
     pts = [
         (10.0, 118.0),
         (12.0, 119.5),
-        (14.6, 120.98),  # Manila-ish
+        (14.6, 120.98),
         (16.0, 122.5),
         (18.0, 125.0),
     ]
@@ -647,160 +673,9 @@ def create_dummy_event(event_id: Optional[str] = None) -> Tuple[str, Dict[str, A
             "lon": hit_lon,
             "distance_to_ph_bbox_km": 0.0,
         },
-        "track": track,  # ✅ used by Flask map
+        "track": track,
     }
     return event_id, event
-
-
-# -----------------------------
-# Flask Viewer (Leaflet Map)
-# -----------------------------
-def render_event_html(event_id: str, event: Dict[str, Any]) -> str:
-    hit = event.get("hit", {})
-    w = event.get("decay_window", {})
-    obj = event.get("object_name", "")
-    norad = event.get("norad_id", "")
-
-    track = event.get("track", []) or []
-    # Convert to [[lat, lon], ...] for Leaflet
-    poly = [[p.get("lat"), p.get("lon")] for p in track if "lat" in p and "lon" in p]
-    poly_json = json.dumps(poly)
-
-    ph = event.get("ph_filter", {}).get("bbox", PH_BBOX)
-    # Leaflet rectangle bounds: [[southWest],[northEast]] in lat/lon
-    ph_bounds = [[ph["lat_min"], ph["lon_min"]], [ph["lat_max"], ph["lon_max"]]]
-    ph_bounds_json = json.dumps(ph_bounds)
-
-    hit_lat = float(hit.get("lat", 0.0) or 0.0)
-    hit_lon = float(hit.get("lon", 0.0) or 0.0)
-    hit_json = json.dumps([hit_lat, hit_lon])
-
-    # Basic view: PH region
-    default_center = [12.5, 122.0]
-    if poly:
-        default_center = poly[len(poly) // 2]
-    center_json = json.dumps(default_center)
-
-    return f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Reentry Alert — NORAD {norad}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-
-  <!-- Leaflet (CDN) -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 18px; }}
-    .wrap {{ max-width: 1000px; }}
-    .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 16px; }}
-    h1 {{ margin: 0 0 8px 0; font-size: 22px; }}
-    .muted {{ color: #666; }}
-    #map {{ height: 520px; border-radius: 12px; margin-top: 12px; border: 1px solid #ddd; }}
-    pre {{ background: #f6f6f6; padding: 12px; border-radius: 8px; overflow-x: auto; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
-    @media (max-width: 760px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-    .tag {{ display: inline-block; padding: 4px 10px; border-radius: 999px; background: #eee; font-size: 12px; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h1>Reentry / TIP Event</h1>
-      <div class="muted">Event ID: <b>{event_id}</b></div>
-      <div style="margin-top:8px;"><span class="tag">{hit.get("type","")}</span></div>
-
-      <div class="grid" style="margin-top:12px;">
-        <div><b>Object:</b> {obj} (NORAD {norad})</div>
-        <div><b>TIP MSG_EPOCH:</b> {event.get("tip_msg_epoch_used","")}</div>
-        <div><b>Decay window (UTC):</b> {w.get("start_utc","")} → {w.get("end_utc","")} <span class="muted">(mode={w.get("mode","")})</span></div>
-        <div><b>Hit time:</b> {hit.get("time_utc","")} | {hit.get("time_ph","")}</div>
-        <div><b>Hit location:</b> lat={hit_lat:.4f}, lon={hit_lon:.4f}</div>
-        <div><b>Track points saved:</b> {len(poly)}</div>
-      </div>
-
-      <div id="map"></div>
-
-      <div style="margin-top: 14px;"><b>Raw JSON:</b></div>
-      <pre>{json.dumps(event, indent=2)}</pre>
-    </div>
-  </div>
-
-<script>
-  const poly = {poly_json};
-  const phBounds = {ph_bounds_json};
-  const hit = {hit_json};
-  const center = {center_json};
-
-  const map = L.map('map').setView(center, 5);
-
-  // OSM tiles
-  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-    maxZoom: 10,
-    attribution: '&copy; OpenStreetMap contributors'
-  }}).addTo(map);
-
-  // PH bbox
-  const rect = L.rectangle(phBounds, {{color: '#ff7800', weight: 2, fillOpacity: 0.0}});
-  rect.addTo(map);
-
-  // Track
-  if (poly.length >= 2) {{
-    const line = L.polyline(poly, {{color: '#1f77b4', weight: 3, opacity: 0.9}});
-    line.addTo(map);
-    map.fitBounds(line.getBounds().pad(0.2));
-  }} else {{
-    map.fitBounds(rect.getBounds().pad(0.2));
-  }}
-
-  // Hit marker
-  if (hit[0] !== 0 || hit[1] !== 0) {{
-    const m = L.circleMarker(hit, {{radius: 7, color: '#d62728', weight: 2, fillOpacity: 0.8}});
-    m.addTo(map);
-    m.bindPopup("Hit / closest point");
-  }}
-</script>
-
-</body>
-</html>"""
-
-
-def make_flask_app() -> Flask:
-    app = Flask(__name__)
-
-    @app.route("/")
-    def index():
-        return Response(
-            "<h3>Reentry Event Viewer</h3><p>Use /event/&lt;event_id&gt;</p>",
-            mimetype="text/html",
-        )
-
-    @app.route("/event/<event_id>")
-    def view_event(event_id: str):
-        path = os.path.join(OUT_DIR, f"{event_id}.json")
-        if not os.path.exists(path):
-            abort(404)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                event = json.load(f)
-        except Exception:
-            abort(500)
-        html = render_event_html(event_id, event)
-        return Response(html, mimetype="text/html")
-
-    @app.route("/event/<event_id>.json")
-    def view_event_json(event_id: str):
-        path = os.path.join(OUT_DIR, f"{event_id}.json")
-        if not os.path.exists(path):
-            abort(404)
-        with open(path, "r", encoding="utf-8") as f:
-            return Response(f.read(), mimetype="application/json")
-
-    return app
 
 
 # -----------------------------
@@ -811,34 +686,31 @@ def cmd_dummy_page() -> None:
     event_id, event = create_dummy_event()
     path = write_event(OUT_DIR, event_id, event)
     print("Dummy event saved:", path)
-    print(f"Open: http://127.0.0.1:{FLASK_PORT}/event/{event_id}")
+
+    link = streamlit_event_link(event_id)
+    if link:
+        print("Open in Streamlit:", link)
+    else:
+        print("Set VIEWER_BASE_URL to generate a viewer link, e.g. https://smcod-ssa.streamlit.app")
 
 
 def cmd_dummy_alert() -> None:
     if not TEAMS_WEBHOOK_URL:
         raise SystemExit("Missing TEAMS_WEBHOOK_URL in env/.env")
-    if not BASE_URL:
-        raise SystemExit("Missing BASE_URL in env/.env (must be reachable by Teams users)")
+    if not VIEWER_BASE_URL:
+        raise SystemExit("Missing VIEWER_BASE_URL in env/.env (your Streamlit app base URL)")
 
     ensure_dir(OUT_DIR)
     event_id, event = create_dummy_event()
     path = write_event(OUT_DIR, event_id, event)
 
-    title, text = format_alert(event_id, event)
-    teams_post(TEAMS_WEBHOOK_URL, title + " (DUMMY TEST)", text)
+    teams_send(event_id, event)
 
     print("Dummy event saved:", path)
-    print("Teams alert posted. Link:", f"{BASE_URL.rstrip('/')}/event/{event_id}")
-    print("Local open (if serving locally):", f"http://127.0.0.1:{FLASK_PORT}/event/{event_id}")
-    print("Saved:", path)
-
-
-def cmd_serve() -> None:
-    ensure_dir(OUT_DIR)
-    app = make_flask_app()
-    print(f"Serving OUT_DIR={OUT_DIR}")
-    print(f"Open: http://127.0.0.1:{FLASK_PORT}/")
-    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False)
+    print("Posted to Teams. Link:", streamlit_event_link(event_id))
+    if not _is_workflow_url(TEAMS_WEBHOOK_URL):
+        print("NOTE: Your TEAMS_WEBHOOK_URL looks like an Incoming Webhook, so you'll get a plain message, not a Workflow card.")
+        print("      For Workflow cards, use the Workflows/Power Automate trigger URL (logic.azure.com...).")
 
 
 def cmd_monitor() -> None:
@@ -852,6 +724,15 @@ def cmd_monitor() -> None:
     session = spacetrack_login(SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD)
 
     print(f"[{dt_to_iso_z(now_utc())}] Monitor starting. NORAD_IDS={NORAD_IDS} poll={POLL_SECONDS}s near={PH_NEAR_KM}km")
+    if not TEAMS_WEBHOOK_URL:
+        print("[INFO] TEAMS_WEBHOOK_URL not set -> no Teams alerts will be sent.")
+    else:
+        if _is_workflow_url(TEAMS_WEBHOOK_URL):
+            print("[INFO] TEAMS_WEBHOOK_URL looks like Workflows/Power Automate -> Workflow cards expected.")
+        else:
+            print("[INFO] TEAMS_WEBHOOK_URL looks like Incoming Webhook -> plain message only (no Workflow card).")
+    if not VIEWER_BASE_URL:
+        print("[INFO] VIEWER_BASE_URL not set -> links will be missing.")
 
     while True:
         loop_started = now_utc()
@@ -863,15 +744,14 @@ def cmd_monitor() -> None:
                         event_id, event = res
                         path = write_event(OUT_DIR, event_id, event)
 
-                        title, text = format_alert(event_id, event)
                         print("\n" + "=" * 90)
-                        print(title)
-                        print(text)
-                        print("- Saved event:", path)
+                        print(f"Triggered: {event['hit']['type']} | {event['object_name']} (NORAD {event['norad_id']})")
+                        print(f"- Saved event: {path}")
+                        print(f"- Viewer: {streamlit_event_link(event_id) or '(missing VIEWER_BASE_URL)'}")
 
                         if TEAMS_WEBHOOK_URL:
-                            teams_post(TEAMS_WEBHOOK_URL, title, text)
-                            print("- Sent Teams webhook alert.")
+                            teams_send(event_id, event)
+                            print("- Posted to Teams.")
 
                 except Exception as e:
                     print(f"[WARN] NORAD {norad}: {e}")
@@ -895,19 +775,16 @@ def cmd_monitor() -> None:
 # Entry
 # -----------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Reentry/TIP monitor + dummy test + Flask viewer (Map + Track).")
+    parser = argparse.ArgumentParser(description="Reentry/TIP monitor + dummy test + Teams Workflow cards (via Flow URL).")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("serve", help="Run Flask viewer at /event/<event_id>")
-    sub.add_parser("dummy-page", help="Create dummy event JSON only (for Flask testing)")
-    sub.add_parser("dummy-alert", help="Create dummy event JSON and post Teams alert with clickable link")
+    sub.add_parser("dummy-page", help="Create dummy event JSON only")
+    sub.add_parser("dummy-alert", help="Create dummy event JSON and post Teams alert (Workflow card if URL is Flow trigger)")
     sub.add_parser("monitor", help="Run polling monitor loop (Space-Track TIP + TLE)")
 
     args = parser.parse_args()
 
-    if args.cmd == "serve":
-        cmd_serve()
-    elif args.cmd == "dummy-page":
+    if args.cmd == "dummy-page":
         cmd_dummy_page()
     elif args.cmd == "dummy-alert":
         cmd_dummy_alert()
