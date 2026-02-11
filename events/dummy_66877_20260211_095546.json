@@ -1,0 +1,18 @@
+{
+  "event_id": "dummy_66877_20260211_095546",
+  "created_utc": "2026-02-11 09:55:46Z",
+  "norad_id": 66877,
+  "object_name": "DUMMY OBJECT (TEST ONLY)",
+  "tip_msg_epoch_used": "2026-02-11 09:55:46",
+  "window_start_utc": "2026-02-11 09:25:46Z",
+  "window_end_utc": "2026-02-11 10:25:46Z",
+  "window_mode": "dummy",
+  "hit_type": "CROSSES_PH",
+  "hit_time_utc": "2026-02-11 09:55:46Z",
+  "hit_time_ph": "2026-02-11 17:55:46 (PH)",
+  "hit_lat": 14.5995,
+  "hit_lon": 120.9842,
+  "distance_to_ph_bbox_km": 0.0,
+  "near_threshold_km": 500.0,
+  "tracks": null
+}

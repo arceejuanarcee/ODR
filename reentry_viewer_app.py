@@ -14,21 +14,19 @@ OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts")
 
 PH_BBOX_DEFAULT = {"lon_min": 115.0, "lon_max": 130.0, "lat_min": 4.0, "lat_max": 22.0}
 
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def load_event(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def list_events(out_dir: str):
     files = sorted(glob.glob(os.path.join(out_dir, "*.json")), reverse=True)
-    # ignore state.json if present
     files = [p for p in files if os.path.basename(p).lower() != "state.json"]
     return files
 
-
 def nice_ts(s: str) -> str:
-    # best-effort for "YYYY-mm-dd HH:MM:SSZ"
     try:
         s = s.replace("Z", "").strip()
         t = dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
@@ -36,54 +34,40 @@ def nice_ts(s: str) -> str:
     except Exception:
         return s
 
+def normalize_lon(lon: float) -> float:
+    # normalize to [-180, 180)
+    return ((lon + 180.0) % 360.0) - 180.0
 
-def _flatten_segments_to_poly(segments):
+def split_dateline_segments(points, jump_deg=180.0):
     """
-    segments: list of segments
-      each segment is a list of [lat, lon, time_str] OR [lat, lon]
-    returns folium-ready list of (lat, lon)
+    points: list of (lat, lon)
+    Splits into segments when lon jumps big (crosses dateline).
     """
-    poly = []
-    for seg in segments or []:
-        if not seg:
-            continue
-        for item in seg:
-            if not item or len(item) < 2:
-                continue
-            lat = float(item[0])
-            lon = float(item[1])
-            poly.append((lat, lon))
-    return poly
-
-
-def _extract_poly_from_tracks_obj(tracks_obj):
-    """
-    tracks_obj from build_envelope_tracks(), e.g.:
-      tracks_obj["mid"] -> list of segments -> each segment list of [lat, lon, time]
-    Prefer mid track. Fallback to min/max.
-    """
-    if not isinstance(tracks_obj, dict):
+    if not points:
         return []
 
-    # Prefer mid, then min, then max
-    for key in ("mid", "min", "max"):
-        segs = tracks_obj.get(key)
-        poly = _flatten_segments_to_poly(segs)
-        if len(poly) >= 2:
-            return poly
+    segs = []
+    cur = [points[0]]
 
-    # If still nothing, try first intermediate set
-    inter = tracks_obj.get("intermediate") or []
-    if inter and isinstance(inter, list):
-        # inter is list of "segs"
-        for segs in inter:
-            poly = _flatten_segments_to_poly(segs)
-            if len(poly) >= 2:
-                return poly
+    for i in range(1, len(points)):
+        lat, lon = points[i]
+        prev_lat, prev_lon = points[i - 1]
+        if abs(lon - prev_lon) > jump_deg:
+            # break segment
+            if len(cur) >= 2:
+                segs.append(cur)
+            cur = [(lat, lon)]
+        else:
+            cur.append((lat, lon))
 
-    return []
+    if len(cur) >= 2:
+        segs.append(cur)
 
+    return segs
 
+# -----------------------------
+# UI
+# -----------------------------
 st.title("Reentry Event Viewer (PH)")
 st.caption(f"Reading events from: `{os.path.abspath(OUT_DIR)}`")
 
@@ -92,7 +76,6 @@ if not files:
     st.warning("No event JSON files found. Run your monitor or dummy generator first.")
     st.stop()
 
-# Build a selector label
 labels = []
 for p in files:
     try:
@@ -142,33 +125,29 @@ with col3:
 
 st.divider()
 
-# -----------------------------------------------------------------------------
-# ✅ Ground track source selection:
-# 1) Prefer legacy "track" (list of dict points)
-# 2) Else use new "tracks" envelope (mid/min/max segments)
-# -----------------------------------------------------------------------------
-poly = []
-
+# -----------------------------
+# Ground track plotting (FIXED)
+# -----------------------------
 track = event.get("track", []) or []
-if track and isinstance(track, list) and isinstance(track[0], dict):
-    # Old format
-    poly = [(p["lat"], p["lon"]) for p in track if "lat" in p and "lon" in p]
-else:
-    # New format
-    tracks_obj = event.get("tracks")
-    poly = _extract_poly_from_tracks_obj(tracks_obj)
+# normalize lon to avoid weirdness, and keep only valid points
+poly = []
+for p in track:
+    if "lat" in p and "lon" in p:
+        try:
+            lat = float(p["lat"])
+            lon = normalize_lon(float(p["lon"]))
+            poly.append((lat, lon))
+        except Exception:
+            pass
 
-if not poly or len(poly) < 2:
-    st.error(
-        "No usable ground track found.\n\n"
-        "Expected either:\n"
-        "- `track`: list of {lat, lon, time_utc}\n"
-        "- OR `tracks`: envelope object with segments like [lat, lon, time]\n"
-    )
+if len(poly) < 2:
+    st.error("No usable `track` points in this event JSON.")
     st.stop()
 
-# Center map
-center = poly[len(poly) // 2]
+segments = split_dateline_segments(poly, jump_deg=180.0)
+
+# Center map (use middle point)
+center = poly[len(poly)//2]
 
 m = folium.Map(location=center, zoom_start=5, control_scale=True)
 
@@ -177,15 +156,17 @@ sw = (ph_bbox["lat_min"], ph_bbox["lon_min"])
 ne = (ph_bbox["lat_max"], ph_bbox["lon_max"])
 folium.Rectangle(bounds=[sw, ne], color="#ff7800", weight=2, fill=False).add_to(m)
 
-# Track polyline
-folium.PolyLine(poly, color="#1f77b4", weight=4, opacity=0.9).add_to(m)
+# Draw each segment separately (prevents dateline wrap line)
+for seg in segments:
+    folium.PolyLine(seg, color="#1f77b4", weight=4, opacity=0.9).add_to(m)
 
 # Hit marker
 hit_lat = float(hit.get("lat", 0.0) or 0.0)
-hit_lon = float(hit.get("lon", 0.0) or 0.0)
-folium.CircleMarker(location=(hit_lat, hit_lon), radius=7, color="#d62728", fill=True, fill_opacity=0.85).add_to(m)
+hit_lon = normalize_lon(float(hit.get("lon", 0.0) or 0.0))
+folium.CircleMarker(location=(hit_lat, hit_lon), radius=7, color="#d62728",
+                    fill=True, fill_opacity=0.85).add_to(m)
 
-# Fit bounds
+# Fit bounds safely across segments by using overall min/max lat/lon after normalization
 lats = [p[0] for p in poly]
 lons = [p[1] for p in poly]
 m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])

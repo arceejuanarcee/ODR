@@ -1,800 +1,319 @@
 #!/usr/bin/env python3
 """
-monitoring.py — Reentry/TIP Monitoring Pipeline + Dummy Test (Teams Workflow Cards compatible)
+Reentry/TIP Monitoring — FIXED ground track + Teams webhook + Streamlit JSON
 
-✅ Space-Track TIP fetch (latest batch)
-✅ Latest TLE fetch
-✅ Groundtrack corridor computation (Skyfield)
-✅ Saves event JSON (viewer reads this)
-✅ Sends Teams via:
-   - Workflows / Power Automate HTTP trigger (recommended): sends JSON payload -> your Flow builds Adaptive Card
-   - Incoming Webhook fallback: sends plain text (no Adaptive Card)
+Commands:
+  python monitoring.py dummy-page
+  python monitoring.py dummy-alert
+  python monitoring.py monitor-once --norad 56817
+  python monitoring.py monitor-loop
 
 Requirements:
   pip install requests skyfield python-dotenv numpy
-
-Env vars (.env):
-  SPACE_TRACK_USERNAME=...
-  SPACE_TRACK_PASSWORD=...
-  NORAD_IDS=66877,56817
-  TEAMS_WEBHOOK_URL=...          # Flow trigger URL preferred (logic.azure.com / powerautomate / flow.microsoft.com)
-  VIEWER_BASE_URL=https://smcod-ssa.streamlit.app   # optional but recommended for clickable viewer link
-  OUT_DIR=./reentry_alerts
-
-Optional tuning:
-  TIP_LIMIT=200
-  POLL_SECONDS=600
-  PH_NEAR_KM=500
-  WINDOW_BEFORE_MIN=120
-  WINDOW_AFTER_MIN=120
-  STEP_SECONDS=30
-  FALLBACK_UNCERT_MIN=48
-  TRACK_MAX_POINTS=350
-
-Usage:
-  python monitoring.py dummy-page
-  python monitoring.py dummy-alert
-  python monitoring.py monitor
 """
 
 from __future__ import annotations
-
 import os
-import re
 import json
 import time
 import math
-import random
 import argparse
 import datetime as dt
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
 
-import numpy as np
 import requests
 from dotenv import load_dotenv
 from skyfield.api import EarthSatellite, load as sf_load
 
-# -----------------------------
-# Load env + constants
-# -----------------------------
+# ==============================
+# ENV / CONFIG
+# ==============================
+
 load_dotenv()
 
 LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
-
-PH_TZ = dt.timezone(dt.timedelta(hours=8))
-EARTH_RADIUS_KM = 6371.0088
-
-# PH bbox quick filter (adjust if you want PAR instead)
-PH_BBOX = {"lon_min": 115.0, "lon_max": 130.0, "lat_min": 4.0, "lat_max": 22.0}
-
-OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts")
-STATE_PATH = os.path.join(OUT_DIR, "state.json")
 
 SPACE_TRACK_USERNAME = os.getenv("SPACE_TRACK_USERNAME", "").strip()
 SPACE_TRACK_PASSWORD = os.getenv("SPACE_TRACK_PASSWORD", "").strip()
 
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
-VIEWER_BASE_URL = os.getenv("VIEWER_BASE_URL", "").strip()  # optional (for clickable link)
+VIEWER_BASE_URL = os.getenv("VIEWER_BASE_URL", "").strip().rstrip("/")
+
+OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts")
 
 TIP_LIMIT = int(os.getenv("TIP_LIMIT", "200"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "600"))
-PH_NEAR_KM = float(os.getenv("PH_NEAR_KM", "500"))
-
 WINDOW_BEFORE_MIN = int(os.getenv("WINDOW_BEFORE_MIN", "120"))
 WINDOW_AFTER_MIN = int(os.getenv("WINDOW_AFTER_MIN", "120"))
 STEP_SECONDS = int(os.getenv("STEP_SECONDS", "30"))
-FALLBACK_UNCERT_MIN = float(os.getenv("FALLBACK_UNCERT_MIN", "48"))
+PH_NEAR_KM = float(os.getenv("PH_NEAR_KM", "500"))
 
-TRACK_MAX_POINTS = int(os.getenv("TRACK_MAX_POINTS", "350"))
+PH_TZ = dt.timezone(dt.timedelta(hours=8))
+PH_BBOX = {"lon_min":115.0,"lon_max":130.0,"lat_min":4.0,"lat_max":22.0}
 
-NORAD_IDS: List[int] = []
-raw_ids = os.getenv("NORAD_IDS", "").strip()
-if raw_ids:
-    for p in raw_ids.split(","):
-        p = p.strip()
-        if p.isdigit():
-            NORAD_IDS.append(int(p))
+# ==============================
+# HELPERS
+# ==============================
 
-
-# -----------------------------
-# Models
-# -----------------------------
-@dataclass
-class TipSolution:
-    msg_epoch: str
-    decay_epoch: str
-    raw: dict
-
-
-# -----------------------------
-# Utilities
-# -----------------------------
-def ensure_dir(path: str) -> None:
+def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
-
-def now_utc() -> dt.datetime:
+def dt_utc():
     return dt.datetime.now(dt.timezone.utc)
 
+def iso_z(t):
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
-def dt_to_iso_z(t: dt.datetime) -> str:
-    t = t.astimezone(dt.timezone.utc)
-    return t.strftime("%Y-%m-%d %H:%M:%SZ")
+def iso_ph(t):
+    return t.astimezone(PH_TZ).strftime("%Y-%m-%d %H:%M:%S (PH)")
 
+def parse_dt(s):
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    d = dt.datetime.fromisoformat(s)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.astimezone(dt.timezone.utc)
 
-def dt_to_iso_ph(t: dt.datetime) -> str:
-    t = t.astimezone(PH_TZ)
-    return t.strftime("%Y-%m-%d %H:%M:%S (PH)")
+# ==============================
+# GEOMETRY
+# ==============================
 
+EARTH_RADIUS_KM = 6371.0
 
-def parse_any_datetime_utc(s: str) -> dt.datetime:
-    if not s:
-        raise ValueError("Empty datetime string")
+def haversine(lat1,lon1,lat2,lon2):
+    p1,p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2-lat1)
+    dl = math.radians(lon2-lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*EARTH_RADIUS_KM*math.asin(math.sqrt(a))
 
-    txt = s.strip()
-    if txt.endswith("Z"):
-        txt2 = txt[:-1] + "+00:00"
-    else:
-        txt2 = txt
-
-    try:
-        d = dt.datetime.fromisoformat(txt2)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=dt.timezone.utc)
-        return d.astimezone(dt.timezone.utc)
-    except Exception:
-        pass
-
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
-        try:
-            return dt.datetime.strptime(txt, fmt).replace(tzinfo=dt.timezone.utc)
-        except Exception:
-            continue
-
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
-        try:
-            return dt.datetime.strptime(txt, fmt).replace(tzinfo=dt.timezone.utc)
-        except Exception:
-            continue
-
-    raise ValueError(f"Unrecognized datetime format: {s!r}")
-
-
-# -----------------------------
-# Geometry helpers
-# -----------------------------
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-16, 1 - a)))
-    return EARTH_RADIUS_KM * c
-
-
-def point_in_bbox(lat: float, lon: float, bbox: Dict[str, float]) -> bool:
-    return (bbox["lat_min"] <= lat <= bbox["lat_max"]) and (bbox["lon_min"] <= lon <= bbox["lon_max"])
-
-
-def distance_to_bbox_km(lat: float, lon: float, bbox: Dict[str, float]) -> float:
-    if point_in_bbox(lat, lon, bbox):
+def distance_to_bbox(lat,lon):
+    if PH_BBOX["lat_min"] <= lat <= PH_BBOX["lat_max"] and \
+       PH_BBOX["lon_min"] <= lon <= PH_BBOX["lon_max"]:
         return 0.0
-    clamped_lat = min(max(lat, bbox["lat_min"]), bbox["lat_max"])
-    clamped_lon = min(max(lon, bbox["lon_min"]), bbox["lon_max"])
-    return haversine_km(lat, lon, clamped_lat, clamped_lon)
+    cl_lat = min(max(lat,PH_BBOX["lat_min"]),PH_BBOX["lat_max"])
+    cl_lon = min(max(lon,PH_BBOX["lon_min"]),PH_BBOX["lon_max"])
+    return haversine(lat,lon,cl_lat,cl_lon)
 
+# ==============================
+# SPACE TRACK
+# ==============================
 
-def downsample_track(track: List[Dict[str, Any]], max_points: int) -> List[Dict[str, Any]]:
-    if max_points <= 0 or len(track) <= max_points:
-        return track
-    step = max(1, int(math.ceil(len(track) / float(max_points))))
-    out = track[::step]
-    if out and out[-1] is not track[-1]:
-        out.append(track[-1])
-    return out
-
-
-# -----------------------------
-# TIP uncertainty parsing (optional)
-# -----------------------------
-def parse_uncertainty_seconds(val: Any) -> Optional[float]:
-    if val is None:
-        return None
-
-    if isinstance(val, (int, float)):
-        x = float(val)
-        if x <= 10:
-            return x * 3600.0
-        if x <= 600:
-            return x * 60.0
-        return x
-
-    s = str(val).strip().lower()
-    if not s:
-        return None
-
-    s = s.replace("~", "").replace("≈", "").replace("about", "").replace("+/-", "±").replace("±", "").strip()
-
-    total = 0.0
-    found = False
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*h", s)
-    if m:
-        total += float(m.group(1)) * 3600.0
-        found = True
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes)\b", s)
-    if m:
-        total += float(m.group(1)) * 60.0
-        found = True
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds)\b", s)
-    if m:
-        total += float(m.group(1))
-        found = True
-
-    if found and total > 0:
-        return total
-
-    m = re.search(r"(\d+(?:\.\d+)?)", s)
-    if m:
-        x = float(m.group(1))
-        if x <= 10:
-            return x * 3600.0
-        if x <= 600:
-            return x * 60.0
-        return x
-
-    return None
-
-
-def tip_batch_uncertainty_seconds(latest_batch: List[TipSolution]) -> Optional[float]:
-    candidate_keys = [
-        "EPOCH_UNCERTAINTY", "EPOCH_UNC",
-        "DECAY_UNCERTAINTY", "DECAY_UNC",
-        "DECAY_EPOCH_UNCERTAINTY", "DECAY_EPOCH_UNC",
-        "WINDOW", "WINDOW_WIDTH", "WINDOW_MINUTES",
-    ]
-    for s in latest_batch:
-        raw = s.raw or {}
-        for k in candidate_keys:
-            if k in raw and raw[k] not in (None, "", "N/A"):
-                sec = parse_uncertainty_seconds(raw[k])
-                if sec and sec > 0:
-                    return sec
-    return None
-
-
-# -----------------------------
-# Space-Track helpers
-# -----------------------------
-def retry_get(session: requests.Session, url: str, tries: int = 6, timeout: int = 30) -> requests.Response:
-    last_exc = None
-    for i in range(tries):
-        try:
-            r = session.get(url, timeout=timeout)
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep((2 ** i) + random.random())
-                continue
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_exc = e
-            time.sleep((2 ** i) + random.random())
-    raise RuntimeError(f"GET failed after retries: {url}") from last_exc
-
-
-def spacetrack_login(username: str, password: str) -> requests.Session:
-    if not username or not password:
-        raise RuntimeError("Missing SPACE_TRACK_USERNAME / SPACE_TRACK_PASSWORD.")
+def login():
     s = requests.Session()
-    r = s.post(LOGIN_URL, data={"identity": username, "password": password}, timeout=30)
+    r = s.post(LOGIN_URL, data={
+        "identity": SPACE_TRACK_USERNAME,
+        "password": SPACE_TRACK_PASSWORD
+    })
     r.raise_for_status()
     return s
 
-
-def fetch_tip(session: requests.Session, norad_id: int, limit: int = TIP_LIMIT) -> list:
-    url = (
-        f"https://www.space-track.org/basicspacedata/query/class/tip/"
-        f"NORAD_CAT_ID/{norad_id}/orderby/MSG_EPOCH%20desc/limit/{int(limit)}/format/json"
-    )
-    r = retry_get(session, url)
-    txt = r.text.strip()
-    return r.json() if txt.startswith("[") else json.loads(txt)
-
-
-def fetch_latest_tle(session: requests.Session, norad_id: int) -> Tuple[str, str, str]:
-    url = (
-        f"https://www.space-track.org/basicspacedata/query/class/gp/"
-        f"NORAD_CAT_ID/{norad_id}/orderby/EPOCH%20desc/limit/1/format/tle"
-    )
-    r = retry_get(session, url)
-    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
-    if len(lines) < 2:
-        raise RuntimeError("TLE fetch returned insufficient lines.")
-    if lines[0].startswith("1 ") and lines[1].startswith("2 "):
-        name = f"NORAD {norad_id}"
-        l1, l2 = lines[0], lines[1]
-    else:
-        if len(lines) < 3:
-            raise RuntimeError("TLE fetch returned insufficient lines (expected name + 2 lines).")
-        name = lines[0]
-        l1, l2 = lines[1], lines[2]
-    return name, l1, l2
-
-
-def parse_tip_solutions(tip_json: list) -> List[TipSolution]:
-    sols: List[TipSolution] = []
-    for row in tip_json:
-        msg = (row.get("MSG_EPOCH") or row.get("MSG_EPOCH ", "") or "").strip()
-        dec = (row.get("DECAY_EPOCH") or "").strip()
-        sols.append(TipSolution(msg_epoch=msg, decay_epoch=dec, raw=row))
-
-    def key(sol: TipSolution):
-        try:
-            return parse_any_datetime_utc(sol.msg_epoch).timestamp()
-        except Exception:
-            return 0.0
-
-    sols.sort(key=key, reverse=True)
-    return sols
-
-
-def select_latest_tip_batch(solutions: List[TipSolution]) -> List[TipSolution]:
-    if not solutions:
-        return []
-    newest_msg = solutions[0].msg_epoch
-    if not newest_msg:
-        return solutions[:1]
-    return [s for s in solutions if s.msg_epoch == newest_msg]
-
-
-def compute_tip_window_from_latest_batch(
-    solutions_latest_batch: List[TipSolution],
-    fallback_uncert_minutes: float
-) -> Tuple[Optional[dt.datetime], Optional[dt.datetime], str]:
-    decays: List[dt.datetime] = []
-    for s in solutions_latest_batch:
-        if s.decay_epoch:
-            try:
-                decays.append(parse_any_datetime_utc(s.decay_epoch))
-            except Exception:
-                pass
-
-    if not decays:
-        return None, None, "none"
-
-    wmin = min(decays)
-    wmax = max(decays)
-
-    if (wmax - wmin).total_seconds() > 0:
-        return wmin, wmax, "tip_spread"
-
-    tip_unc_sec = tip_batch_uncertainty_seconds(solutions_latest_batch)
-    if tip_unc_sec and tip_unc_sec > 0:
-        half = dt.timedelta(seconds=float(tip_unc_sec))
-        return wmin - half, wmax + half, "tip_uncertainty"
-
-    half = dt.timedelta(minutes=float(fallback_uncert_minutes))
-    return wmin - half, wmax + half, "fallback_uncertainty"
-
-
-# -----------------------------
-# Ground track (simple list of points for Streamlit viewer)
-# -----------------------------
-def groundtrack_corridor(
-    sat: EarthSatellite,
-    t_center: dt.datetime,
-    minutes_before: int,
-    minutes_after: int,
-    step_seconds: int
-) -> Tuple[List[float], List[float], List[dt.datetime]]:
-    ts = sf_load.timescale()
-    start = t_center - dt.timedelta(minutes=minutes_before)
-    end = t_center + dt.timedelta(minutes=minutes_after)
-
-    times_dt: List[dt.datetime] = []
-    cur = start
-    while cur <= end:
-        times_dt.append(cur)
-        cur += dt.timedelta(seconds=step_seconds)
-
-    t_sf = ts.from_datetimes(times_dt)
-    geoc = sat.at(t_sf)
-    sub = geoc.subpoint()
-
-    lats = list(sub.latitude.degrees)
-    lons_raw = list(sub.longitude.degrees)
-    # normalize to [-180, 180] for Folium
-    lons = [((x + 180) % 360) - 180 for x in lons_raw]
-    return lats, lons, times_dt
-
-
-# -----------------------------
-# State + output
-# -----------------------------
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_PATH):
-        return {"last_msg_epoch": {}}
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"last_msg_epoch": {}}
-
-
-def save_state(state: Dict[str, Any]) -> None:
-    ensure_dir(OUT_DIR)
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-
-
-def write_event(out_dir: str, event_id: str, event: Dict[str, Any]) -> str:
-    ensure_dir(out_dir)
-    path = os.path.join(out_dir, f"{event_id}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(event, f, indent=2)
-    return path
-
-
-# -----------------------------
-# Viewer link
-# -----------------------------
-def streamlit_event_link(event_id: str) -> str:
-    if not VIEWER_BASE_URL:
-        return ""
-    base = VIEWER_BASE_URL.rstrip("/")
-    return f"{base}/?event_id={event_id}"
-
-
-# -----------------------------
-# Teams posting
-# -----------------------------
-def _is_workflow_url(url: str) -> bool:
-    u = (url or "").lower()
-    return ("logic.azure.com" in u) or ("powerautomate" in u) or ("flow.microsoft" in u) or ("logic-" in u)
-
-
-def teams_send(event_id: str, event: Dict[str, Any]) -> None:
-    """
-    - If TEAMS_WEBHOOK_URL is a Workflows/Power Automate trigger URL:
-        send JSON payload (your Flow builds the adaptive card)
-    - Else (Incoming Webhook):
-        send plain markdown text
-    """
-    if not TEAMS_WEBHOOK_URL:
-        return
-
-    link = streamlit_event_link(event_id)
-
-    payload = {
-        "event_id": event_id,
-        "viewer_url": link,
-        "norad_id": event.get("norad_id"),
-        "object_name": event.get("object_name"),
-        "tip_msg_epoch_used": event.get("tip_msg_epoch_used"),
-        "window_start_utc": event.get("decay_window", {}).get("start_utc"),
-        "window_end_utc": event.get("decay_window", {}).get("end_utc"),
-        "window_mode": event.get("decay_window", {}).get("mode"),
-        "hit_type": event.get("hit", {}).get("type"),
-        "hit_time_utc": event.get("hit", {}).get("time_utc"),
-        "hit_time_ph": event.get("hit", {}).get("time_ph"),
-        "hit_lat": event.get("hit", {}).get("lat"),
-        "hit_lon": event.get("hit", {}).get("lon"),
-        "distance_to_ph_bbox_km": event.get("hit", {}).get("distance_to_ph_bbox_km"),
-        "near_threshold_km": event.get("ph_filter", {}).get("near_km_threshold"),
-    }
-
-    if _is_workflow_url(TEAMS_WEBHOOK_URL):
-        r = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=25)
-        r.raise_for_status()
-        return
-
-    # Incoming Webhook fallback (plain message)
-    title = f"Reentry/TIP Alert — {payload.get('hit_type')} — {payload.get('object_name')} (NORAD {payload.get('norad_id')})"
-    text = (
-        f"- Window (UTC): {payload.get('window_start_utc')} → {payload.get('window_end_utc')} (mode={payload.get('window_mode')})\n"
-        f"- Hit: {payload.get('hit_time_utc')} | {payload.get('hit_time_ph')}\n"
-        f"- Location: lat={payload.get('hit_lat')}, lon={payload.get('hit_lon')}\n"
-        f"- Dist to PH bbox: {payload.get('distance_to_ph_bbox_km')} km (threshold={payload.get('near_threshold_km')} km)\n"
-    )
-    if link:
-        text += f"\nView details:\n{link}\n"
-
-    r = requests.post(TEAMS_WEBHOOK_URL, json={"text": f"**{title}**\n\n{text}"}, timeout=25)
+def fetch_tip(session,norad):
+    url = f"https://www.space-track.org/basicspacedata/query/class/tip/NORAD_CAT_ID/{norad}/orderby/MSG_EPOCH desc/limit/{TIP_LIMIT}/format/json"
+    r = session.get(url)
     r.raise_for_status()
+    return r.json()
 
+def fetch_tle(session,norad):
+    url = f"https://www.space-track.org/basicspacedata/query/class/gp/NORAD_CAT_ID/{norad}/orderby/EPOCH desc/limit/1/format/tle"
+    r = session.get(url)
+    r.raise_for_status()
+    lines=[l.strip() for l in r.text.splitlines() if l.strip()]
+    if lines[0].startswith("1 "):
+        return f"NORAD {norad}",lines[0],lines[1]
+    return lines[0],lines[1],lines[2]
 
-# -----------------------------
-# Monitoring logic (one object)
-# -----------------------------
-def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
-    tip_raw = fetch_tip(session, norad_id, limit=TIP_LIMIT)
-    sols_all = parse_tip_solutions(tip_raw)
-    latest_batch = select_latest_tip_batch(sols_all)
-    if not latest_batch:
-        return None
+# ==============================
+# GROUND TRACK (FIXED)
+# ==============================
 
-    latest_msg_epoch = latest_batch[0].msg_epoch or ""
-    last_seen = (state.get("last_msg_epoch", {}) or {}).get(str(norad_id))
+def groundtrack(sat,t_center):
+    ts=sf_load.timescale()
+    start=t_center-dt.timedelta(minutes=WINDOW_BEFORE_MIN)
+    end=t_center+dt.timedelta(minutes=WINDOW_AFTER_MIN)
 
-    # no change => no alert
-    if last_seen and latest_msg_epoch and latest_msg_epoch == last_seen:
-        return None
+    times=[]
+    cur=start
+    while cur<=end:
+        times.append(cur)
+        cur+=dt.timedelta(seconds=STEP_SECONDS)
 
-    wmin, wmax, mode = compute_tip_window_from_latest_batch(latest_batch, FALLBACK_UNCERT_MIN)
+    t_sf=ts.from_datetimes(times)
+    sub=sat.at(t_sf).subpoint()
 
-    # update seen (avoid spam)
-    state.setdefault("last_msg_epoch", {})[str(norad_id)] = latest_msg_epoch
+    lats=list(sub.latitude.degrees)
+    lons_raw=list(sub.longitude.degrees)
 
-    if not (wmin and wmax):
-        return None
+    # NORMALIZE LONGITUDE (-180 to 180)
+    lons=[((x+180)%360)-180 for x in lons_raw]
 
-    name, l1, l2 = fetch_latest_tle(session, norad_id)
-    ts = sf_load.timescale()
-    sat = EarthSatellite(l1, l2, name, ts)
+    track=[]
+    for lat,lon,t in zip(lats,lons,times):
+        track.append({
+            "time_utc": iso_z(t),
+            "lat": float(lat),
+            "lon": float(lon)
+        })
 
-    t_center = wmin + (wmax - wmin) / 2
-    lats, lons, times_dt = groundtrack_corridor(sat, t_center, WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN, STEP_SECONDS)
+    return track
 
-    # Track saved as list-of-dicts for Streamlit viewer
-    track = []
-    min_dist = 1e18
-    min_idx = None
+# ==============================
+# TEAMS
+# ==============================
 
-    inside_hits: List[int] = []
-    near_hits: List[int] = []
+def send_teams(event_id,event):
+    if not TEAMS_WEBHOOK_URL:
+        print("No TEAMS_WEBHOOK_URL set.")
+        return
 
-    for i, (lat, lon, tt) in enumerate(zip(lats, lons, times_dt)):
-        d = distance_to_bbox_km(float(lat), float(lon), PH_BBOX)
-        if d < min_dist:
-            min_dist = d
-            min_idx = i
+    link = f"{VIEWER_BASE_URL}/?event_id={event_id}" if VIEWER_BASE_URL else ""
 
-        if d == 0.0:
-            inside_hits.append(i)
-        elif d <= PH_NEAR_KM:
-            near_hits.append(i)
-
-        track.append({"time_utc": dt_to_iso_z(tt), "lat": float(lat), "lon": float(lon)})
-
-    track = downsample_track(track, TRACK_MAX_POINTS)
-
-    triggered = bool(inside_hits or near_hits)
-    if not triggered:
-        return None
-
-    def pick_best(idxs: List[int]) -> int:
-        best = idxs[0]
-        best_d = 1e18
-        for j in idxs:
-            dj = distance_to_bbox_km(float(lats[j]), float(lons[j]), PH_BBOX)
-            if dj < best_d:
-                best_d = dj
-                best = j
-        return best
-
-    if inside_hits:
-        idx = pick_best(inside_hits)
-        hit_type = "CROSSES_PH"
-    else:
-        idx = pick_best(near_hits)
-        hit_type = "NEAR_PH"
-
-    event_id = f"{norad_id}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    event: Dict[str, Any] = {
-        "created_utc": dt_to_iso_z(now_utc()),
-        "norad_id": norad_id,
-        "object_name": name,
-        "tip_msg_epoch_used": latest_msg_epoch,
-        "decay_window": {
-            "start_utc": dt_to_iso_z(wmin),
-            "end_utc": dt_to_iso_z(wmax),
-            "mode": mode,
-        },
-        "corridor": {
-            "center_utc": dt_to_iso_z(t_center),
-            "before_min": WINDOW_BEFORE_MIN,
-            "after_min": WINDOW_AFTER_MIN,
-            "step_seconds": STEP_SECONDS,
-            "track_points_saved": len(track),
-        },
-        "ph_filter": {
-            "bbox": PH_BBOX,
-            "near_km_threshold": PH_NEAR_KM,
-            "min_distance_km": float(min_dist),
-            "min_distance_time_utc": dt_to_iso_z(times_dt[min_idx]) if min_idx is not None else None,
-            "min_distance_time_ph": dt_to_iso_ph(times_dt[min_idx]) if min_idx is not None else None,
-        },
-        "hit": {
-            "type": hit_type,
-            "time_utc": dt_to_iso_z(times_dt[idx]),
-            "time_ph": dt_to_iso_ph(times_dt[idx]),
-            "lat": float(lats[idx]),
-            "lon": float(lons[idx]),
-            "distance_to_ph_bbox_km": float(distance_to_bbox_km(float(lats[idx]), float(lons[idx]), PH_BBOX)),
-        },
-        "track": track,
+    payload={
+        "event_id":event_id,
+        "viewer_url":link,
+        "norad_id":event["norad_id"],
+        "object_name":event["object_name"],
+        "window_start_utc":event["decay_window"]["start_utc"],
+        "window_end_utc":event["decay_window"]["end_utc"],
+        "hit_type":event["hit"]["type"],
+        "hit_time_utc":event["hit"]["time_utc"],
+        "hit_lat":event["hit"]["lat"],
+        "hit_lon":event["hit"]["lon"]
     }
 
-    return event_id, event
+    r=requests.post(TEAMS_WEBHOOK_URL,json=payload)
+    r.raise_for_status()
+    print("Posted to Teams.")
 
+# ==============================
+# BUILD EVENT
+# ==============================
 
-# -----------------------------
-# Dummy events (for testing Teams + Streamlit)
-# -----------------------------
-def create_dummy_event(event_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
-    t = now_utc()
-    if event_id is None:
-        event_id = f"dummy_66877_{t.strftime('%Y%m%d_%H%M%S')}"
+def build_event(session,norad):
 
-    pts = [
-        (10.0, 118.0),
-        (12.0, 119.5),
-        (14.6, 120.98),
-        (16.0, 122.5),
-        (18.0, 125.0),
-    ]
+    tip=fetch_tip(session,norad)
+    if not tip:
+        raise RuntimeError("No TIP returned")
 
-    track = []
-    for i in range(len(pts) - 1):
-        lat1, lon1 = pts[i]
-        lat2, lon2 = pts[i + 1]
-        for k in range(18):
-            f = k / 18.0
-            lat = lat1 + (lat2 - lat1) * f
-            lon = lon1 + (lon2 - lon1) * f
-            tt = t - dt.timedelta(minutes=60) + dt.timedelta(minutes=6 * (i * 18 + k))
-            track.append({"time_utc": dt_to_iso_z(tt), "lat": float(lat), "lon": float(lon)})
-    track = downsample_track(track, TRACK_MAX_POINTS)
+    msg_epoch=tip[0]["MSG_EPOCH"]
+    batch=[r for r in tip if r["MSG_EPOCH"]==msg_epoch]
 
-    hit_lat, hit_lon = 14.5995, 120.9842
+    decays=[parse_dt(r["DECAY_EPOCH"]) for r in batch if r.get("DECAY_EPOCH")]
+    if not decays:
+        raise RuntimeError("No DECAY_EPOCH")
 
-    event = {
-        "created_utc": dt_to_iso_z(t),
-        "norad_id": 66877,
-        "object_name": "DUMMY OBJECT (TEST ONLY)",
-        "tip_msg_epoch_used": dt_to_iso_z(t),
-        "decay_window": {
-            "start_utc": dt_to_iso_z(t - dt.timedelta(minutes=30)),
-            "end_utc": dt_to_iso_z(t + dt.timedelta(minutes=30)),
-            "mode": "dummy",
+    wmin=min(decays)
+    wmax=max(decays)
+
+    name,l1,l2=fetch_tle(session,norad)
+    sat=EarthSatellite(l1,l2,name,sf_load.timescale())
+
+    t_center=wmin+(wmax-wmin)/2
+    track=groundtrack(sat,t_center)
+
+    min_dist=1e9
+    best=None
+    for p in track:
+        d=distance_to_bbox(p["lat"],p["lon"])
+        if d<min_dist:
+            min_dist=d
+            best=p
+
+    hit_type="CROSSES_PH" if min_dist==0 else ("NEAR_PH" if min_dist<=PH_NEAR_KM else "NOT_NEAR_PH")
+
+    event_id=f"{norad}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    event={
+        "created_utc":iso_z(dt_utc()),
+        "norad_id":norad,
+        "object_name":name,
+        "tip_msg_epoch_used":msg_epoch,
+        "decay_window":{
+            "start_utc":iso_z(wmin),
+            "end_utc":iso_z(wmax)
         },
-        "ph_filter": {
-            "bbox": PH_BBOX,
-            "near_km_threshold": PH_NEAR_KM,
-            "min_distance_km": 0.0,
-            "min_distance_time_utc": dt_to_iso_z(t),
-            "min_distance_time_ph": dt_to_iso_ph(t),
+        "hit":{
+            "type":hit_type,
+            "time_utc":best["time_utc"],
+            "time_ph":iso_ph(parse_dt(best["time_utc"])),
+            "lat":best["lat"],
+            "lon":best["lon"],
+            "distance_to_ph_bbox_km":float(min_dist)
         },
-        "hit": {
-            "type": "CROSSES_PH",
-            "time_utc": dt_to_iso_z(t),
-            "time_ph": dt_to_iso_ph(t),
-            "lat": hit_lat,
-            "lon": hit_lon,
-            "distance_to_ph_bbox_km": 0.0,
-        },
-        "track": track,
+        "track":track
     }
-    return event_id, event
 
+    return event_id,event
 
-# -----------------------------
-# Commands
-# -----------------------------
-def cmd_dummy_page() -> None:
+# ==============================
+# COMMANDS
+# ==============================
+
+def cmd_monitor_once(norad):
     ensure_dir(OUT_DIR)
-    event_id, event = create_dummy_event()
-    path = write_event(OUT_DIR, event_id, event)
-    print("Dummy event saved:", path)
+    session=login()
+    event_id,event=build_event(session,norad)
 
-    link = streamlit_event_link(event_id)
-    if link:
-        print("Open in Streamlit:", link)
-    else:
-        print("Set VIEWER_BASE_URL to generate a viewer link.")
+    path=os.path.join(OUT_DIR,f"{event_id}.json")
+    with open(path,"w") as f:
+        json.dump(event,f,indent=2)
 
+    print("\nSaved:",path)
+    print("Hit type:",event["hit"]["type"])
+    print("Closest distance:",event["hit"]["distance_to_ph_bbox_km"],"km")
 
-def cmd_dummy_alert() -> None:
+    if event["hit"]["type"]!="NOT_NEAR_PH":
+        send_teams(event_id,event)
+
+def cmd_dummy_page():
     ensure_dir(OUT_DIR)
-    event_id, event = create_dummy_event()
-    path = write_event(OUT_DIR, event_id, event)
+    event_id="dummy_test"
+    event={
+        "created_utc":iso_z(dt_utc()),
+        "norad_id":99999,
+        "object_name":"DUMMY OBJECT",
+        "tip_msg_epoch_used":"dummy",
+        "decay_window":{
+            "start_utc":iso_z(dt_utc()),
+            "end_utc":iso_z(dt_utc())
+        },
+        "hit":{
+            "type":"CROSSES_PH",
+            "time_utc":iso_z(dt_utc()),
+            "time_ph":iso_ph(dt_utc()),
+            "lat":14.6,
+            "lon":121.0,
+            "distance_to_ph_bbox_km":0
+        },
+        "track":[
+            {"time_utc":iso_z(dt_utc()),"lat":10,"lon":118},
+            {"time_utc":iso_z(dt_utc()),"lat":14,"lon":121},
+            {"time_utc":iso_z(dt_utc()),"lat":18,"lon":125}
+        ]
+    }
+    path=os.path.join(OUT_DIR,f"{event_id}.json")
+    with open(path,"w") as f:
+        json.dump(event,f,indent=2)
+    print("Dummy saved:",path)
 
-    if TEAMS_WEBHOOK_URL:
-        teams_send(event_id, event)
-        print("Posted to Teams.")
-    else:
-        print("TEAMS_WEBHOOK_URL not set; skipped Teams post.")
+# ==============================
+# ENTRY
+# ==============================
 
-    print("Dummy event saved:", path)
-    if VIEWER_BASE_URL:
-        print("Viewer:", streamlit_event_link(event_id))
+def main():
+    parser=argparse.ArgumentParser()
+    sub=parser.add_subparsers(dest="cmd",required=True)
 
+    sub.add_parser("dummy-page")
+    m=sub.add_parser("monitor-once")
+    m.add_argument("--norad",type=int,required=True)
 
-def cmd_monitor() -> None:
-    if not NORAD_IDS:
-        raise SystemExit("No NORAD_IDS set. Put NORAD_IDS=66877,56817 in your .env")
-    if not SPACE_TRACK_USERNAME or not SPACE_TRACK_PASSWORD:
-        raise SystemExit("Missing SPACE_TRACK_USERNAME / SPACE_TRACK_PASSWORD")
+    args=parser.parse_args()
 
-    ensure_dir(OUT_DIR)
-    state = load_state()
-    session = spacetrack_login(SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD)
-
-    print(f"[{dt_to_iso_z(now_utc())}] Monitor starting. NORAD_IDS={NORAD_IDS} poll={POLL_SECONDS}s near={PH_NEAR_KM}km")
-    if TEAMS_WEBHOOK_URL:
-        if _is_workflow_url(TEAMS_WEBHOOK_URL):
-            print("[INFO] Teams URL looks like Workflows/Power Automate -> Workflow card expected.")
-        else:
-            print("[INFO] Teams URL looks like Incoming Webhook -> plain message only.")
-    else:
-        print("[INFO] TEAMS_WEBHOOK_URL not set -> no Teams alerts will be sent.")
-    if not VIEWER_BASE_URL:
-        print("[INFO] VIEWER_BASE_URL not set -> viewer links will be missing.")
-
-    while True:
-        loop_started = now_utc()
-        try:
-            for norad in NORAD_IDS:
-                try:
-                    res = check_one_object(session, norad, state)
-                    if res:
-                        event_id, event = res
-                        path = write_event(OUT_DIR, event_id, event)
-
-                        print("\n" + "=" * 90)
-                        print(f"Triggered: {event['hit']['type']} | {event['object_name']} (NORAD {event['norad_id']})")
-                        print(f"- Saved event: {path}")
-                        print(f"- Viewer: {streamlit_event_link(event_id) or '(missing VIEWER_BASE_URL)'}")
-
-                        if TEAMS_WEBHOOK_URL:
-                            teams_send(event_id, event)
-                            print("- Posted to Teams.")
-
-                except Exception as e:
-                    print(f"[WARN] NORAD {norad}: {e}")
-
-            save_state(state)
-
-        except Exception as e:
-            print(f"[WARN] Loop error: {e}")
-            try:
-                session = spacetrack_login(SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD)
-                print("[INFO] Re-logged in to Space-Track.")
-            except Exception as e2:
-                print(f"[ERROR] Re-login failed: {e2}")
-
-        elapsed = (now_utc() - loop_started).total_seconds()
-        sleep_s = max(1.0, float(POLL_SECONDS) - elapsed)
-        time.sleep(sleep_s)
-
-
-# -----------------------------
-# Entry
-# -----------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Reentry/TIP monitor + dummy test + Teams Workflow cards via Flow URL.")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    sub.add_parser("dummy-page", help="Create dummy event JSON only")
-    sub.add_parser("dummy-alert", help="Create dummy event JSON and post Teams alert (Workflow card if URL is Flow trigger)")
-    sub.add_parser("monitor", help="Run polling monitor loop (Space-Track TIP + TLE)")
-
-    args = parser.parse_args()
-
-    if args.cmd == "dummy-page":
+    if args.cmd=="dummy-page":
         cmd_dummy_page()
-    elif args.cmd == "dummy-alert":
-        cmd_dummy_alert()
-    elif args.cmd == "monitor":
-        cmd_monitor()
-    else:
-        raise SystemExit("Unknown command")
+    elif args.cmd=="monitor-once":
+        cmd_monitor_once(args.norad)
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
