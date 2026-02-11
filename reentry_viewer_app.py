@@ -14,15 +14,18 @@ OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts")
 
 PH_BBOX_DEFAULT = {"lon_min": 115.0, "lon_max": 130.0, "lat_min": 4.0, "lat_max": 22.0}
 
+
 def load_event(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def list_events(out_dir: str):
     files = sorted(glob.glob(os.path.join(out_dir, "*.json")), reverse=True)
     # ignore state.json if present
     files = [p for p in files if os.path.basename(p).lower() != "state.json"]
     return files
+
 
 def nice_ts(s: str) -> str:
     # best-effort for "YYYY-mm-dd HH:MM:SSZ"
@@ -33,8 +36,55 @@ def nice_ts(s: str) -> str:
     except Exception:
         return s
 
-st.title("Reentry Event Viewer (PH)")
 
+def _flatten_segments_to_poly(segments):
+    """
+    segments: list of segments
+      each segment is a list of [lat, lon, time_str] OR [lat, lon]
+    returns folium-ready list of (lat, lon)
+    """
+    poly = []
+    for seg in segments or []:
+        if not seg:
+            continue
+        for item in seg:
+            if not item or len(item) < 2:
+                continue
+            lat = float(item[0])
+            lon = float(item[1])
+            poly.append((lat, lon))
+    return poly
+
+
+def _extract_poly_from_tracks_obj(tracks_obj):
+    """
+    tracks_obj from build_envelope_tracks(), e.g.:
+      tracks_obj["mid"] -> list of segments -> each segment list of [lat, lon, time]
+    Prefer mid track. Fallback to min/max.
+    """
+    if not isinstance(tracks_obj, dict):
+        return []
+
+    # Prefer mid, then min, then max
+    for key in ("mid", "min", "max"):
+        segs = tracks_obj.get(key)
+        poly = _flatten_segments_to_poly(segs)
+        if len(poly) >= 2:
+            return poly
+
+    # If still nothing, try first intermediate set
+    inter = tracks_obj.get("intermediate") or []
+    if inter and isinstance(inter, list):
+        # inter is list of "segs"
+        for segs in inter:
+            poly = _flatten_segments_to_poly(segs)
+            if len(poly) >= 2:
+                return poly
+
+    return []
+
+
+st.title("Reentry Event Viewer (PH)")
 st.caption(f"Reading events from: `{os.path.abspath(OUT_DIR)}`")
 
 files = list_events(OUT_DIR)
@@ -92,15 +142,33 @@ with col3:
 
 st.divider()
 
-track = event.get("track", []) or []
-poly = [(p["lat"], p["lon"]) for p in track if "lat" in p and "lon" in p]
+# -----------------------------------------------------------------------------
+# ✅ Ground track source selection:
+# 1) Prefer legacy "track" (list of dict points)
+# 2) Else use new "tracks" envelope (mid/min/max segments)
+# -----------------------------------------------------------------------------
+poly = []
 
-if not poly:
-    st.error("No `track` found in this event JSON. Regenerate dummy/monitor with the updated script that saves track.")
+track = event.get("track", []) or []
+if track and isinstance(track, list) and isinstance(track[0], dict):
+    # Old format
+    poly = [(p["lat"], p["lon"]) for p in track if "lat" in p and "lon" in p]
+else:
+    # New format
+    tracks_obj = event.get("tracks")
+    poly = _extract_poly_from_tracks_obj(tracks_obj)
+
+if not poly or len(poly) < 2:
+    st.error(
+        "No usable ground track found.\n\n"
+        "Expected either:\n"
+        "- `track`: list of {lat, lon, time_utc}\n"
+        "- OR `tracks`: envelope object with segments like [lat, lon, time]\n"
+    )
     st.stop()
 
 # Center map
-center = poly[len(poly)//2]
+center = poly[len(poly) // 2]
 
 m = folium.Map(location=center, zoom_start=5, control_scale=True)
 

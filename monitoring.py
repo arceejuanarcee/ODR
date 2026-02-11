@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
 """
-Reentry/TIP Monitoring Pipeline + Dummy Test
-✅ Sends a WORKFLOW CARD (Adaptive Card) via Microsoft Teams Workflows / Power Automate
-✅ Includes a CLICKABLE LINK to your Streamlit viewer:
-    VIEWER_BASE_URL/?event_id=<event_id>
+monitoring.py — Reentry/TIP Monitoring Pipeline + Dummy Test (Teams Workflow Cards compatible)
 
-IMPORTANT:
-- For a Workflow card, TEAMS_WEBHOOK_URL must be a *Workflows / Power Automate HTTP trigger* URL
-  (usually contains: logic.azure.com / powerautomate / flow.microsoft.com)
-- If TEAMS_WEBHOOK_URL is an Incoming Webhook (outlook.office.com/webhook/...), you will only get a plain message.
+✅ Space-Track TIP fetch (latest batch)
+✅ Latest TLE fetch
+✅ Groundtrack corridor computation (Skyfield)
+✅ Saves event JSON (viewer reads this)
+✅ Sends Teams via:
+   - Workflows / Power Automate HTTP trigger (recommended): sends JSON payload -> your Flow builds Adaptive Card
+   - Incoming Webhook fallback: sends plain text (no Adaptive Card)
+
+Requirements:
+  pip install requests skyfield python-dotenv numpy
 
 Env vars (.env):
-  SPACE_TRACK_USERNAME=
-  SPACE_TRACK_PASSWORD=
-  NORAD_IDS=66877,12345
-  TEAMS_WEBHOOK_URL=...  # Workflows trigger URL for cards (recommended)
-  VIEWER_BASE_URL=https://smcod-ssa.streamlit.app
+  SPACE_TRACK_USERNAME=...
+  SPACE_TRACK_PASSWORD=...
+  NORAD_IDS=66877,56817
+  TEAMS_WEBHOOK_URL=...          # Flow trigger URL preferred (logic.azure.com / powerautomate / flow.microsoft.com)
+  VIEWER_BASE_URL=https://smcod-ssa.streamlit.app   # optional but recommended for clickable viewer link
   OUT_DIR=./reentry_alerts
 
 Optional tuning:
+  TIP_LIMIT=200
   POLL_SECONDS=600
   PH_NEAR_KM=500
   WINDOW_BEFORE_MIN=120
   WINDOW_AFTER_MIN=120
   STEP_SECONDS=30
   FALLBACK_UNCERT_MIN=48
-  TRACK_MAX_POINTS=300
+  TRACK_MAX_POINTS=350
 
 Usage:
   python monitoring.py dummy-page
@@ -70,12 +74,10 @@ STATE_PATH = os.path.join(OUT_DIR, "state.json")
 SPACE_TRACK_USERNAME = os.getenv("SPACE_TRACK_USERNAME", "").strip()
 SPACE_TRACK_PASSWORD = os.getenv("SPACE_TRACK_PASSWORD", "").strip()
 
-# You said you already have this in .env:
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
+VIEWER_BASE_URL = os.getenv("VIEWER_BASE_URL", "").strip()  # optional (for clickable link)
 
-VIEWER_BASE_URL = os.getenv("VIEWER_BASE_URL", "").strip()  # Streamlit base URL
-
-DEFAULT_TIP_LIMIT = int(os.getenv("TIP_LIMIT", "200"))
+TIP_LIMIT = int(os.getenv("TIP_LIMIT", "200"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "600"))
 PH_NEAR_KM = float(os.getenv("PH_NEAR_KM", "500"))
 
@@ -84,7 +86,7 @@ WINDOW_AFTER_MIN = int(os.getenv("WINDOW_AFTER_MIN", "120"))
 STEP_SECONDS = int(os.getenv("STEP_SECONDS", "30"))
 FALLBACK_UNCERT_MIN = float(os.getenv("FALLBACK_UNCERT_MIN", "48"))
 
-TRACK_MAX_POINTS = int(os.getenv("TRACK_MAX_POINTS", "300"))
+TRACK_MAX_POINTS = int(os.getenv("TRACK_MAX_POINTS", "350"))
 
 NORAD_IDS: List[int] = []
 raw_ids = os.getenv("NORAD_IDS", "").strip()
@@ -106,7 +108,7 @@ class TipSolution:
 
 
 # -----------------------------
-# Time helpers
+# Utilities
 # -----------------------------
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -195,7 +197,7 @@ def downsample_track(track: List[Dict[str, Any]], max_points: int) -> List[Dict[
 
 
 # -----------------------------
-# TIP uncertainty parsing
+# TIP uncertainty parsing (optional)
 # -----------------------------
 def parse_uncertainty_seconds(val: Any) -> Optional[float]:
     if val is None:
@@ -293,7 +295,7 @@ def spacetrack_login(username: str, password: str) -> requests.Session:
     return s
 
 
-def fetch_tip(session: requests.Session, norad_id: int, limit: int = DEFAULT_TIP_LIMIT) -> list:
+def fetch_tip(session: requests.Session, norad_id: int, limit: int = TIP_LIMIT) -> list:
     url = (
         f"https://www.space-track.org/basicspacedata/query/class/tip/"
         f"NORAD_CAT_ID/{norad_id}/orderby/MSG_EPOCH%20desc/limit/{int(limit)}/format/json"
@@ -380,7 +382,7 @@ def compute_tip_window_from_latest_batch(
 
 
 # -----------------------------
-# Ground track
+# Ground track (simple list of points for Streamlit viewer)
 # -----------------------------
 def groundtrack_corridor(
     sat: EarthSatellite,
@@ -405,6 +407,7 @@ def groundtrack_corridor(
 
     lats = list(sub.latitude.degrees)
     lons_raw = list(sub.longitude.degrees)
+    # normalize to [-180, 180] for Folium
     lons = [((x + 180) % 360) - 180 for x in lons_raw]
     return lats, lons, times_dt
 
@@ -423,6 +426,7 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(state: Dict[str, Any]) -> None:
+    ensure_dir(OUT_DIR)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, sort_keys=True)
 
@@ -455,10 +459,10 @@ def _is_workflow_url(url: str) -> bool:
 
 def teams_send(event_id: str, event: Dict[str, Any]) -> None:
     """
-    If TEAMS_WEBHOOK_URL is a Workflows/Power Automate trigger URL:
-      -> send JSON payload for your workflow to build an Adaptive Card (Workflow card)
-    If it's an Incoming Webhook:
-      -> fallback to plain message
+    - If TEAMS_WEBHOOK_URL is a Workflows/Power Automate trigger URL:
+        send JSON payload (your Flow builds the adaptive card)
+    - Else (Incoming Webhook):
+        send plain markdown text
     """
     if not TEAMS_WEBHOOK_URL:
         return
@@ -484,12 +488,11 @@ def teams_send(event_id: str, event: Dict[str, Any]) -> None:
     }
 
     if _is_workflow_url(TEAMS_WEBHOOK_URL):
-        # ✅ Workflows / Power Automate: send JSON, workflow creates the card
         r = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=25)
         r.raise_for_status()
         return
 
-    # Fallback: Incoming Webhook (plain text only)
+    # Incoming Webhook fallback (plain message)
     title = f"Reentry/TIP Alert — {payload.get('hit_type')} — {payload.get('object_name')} (NORAD {payload.get('norad_id')})"
     text = (
         f"- Window (UTC): {payload.get('window_start_utc')} → {payload.get('window_end_utc')} (mode={payload.get('window_mode')})\n"
@@ -508,7 +511,7 @@ def teams_send(event_id: str, event: Dict[str, Any]) -> None:
 # Monitoring logic (one object)
 # -----------------------------
 def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
-    tip_raw = fetch_tip(session, norad_id)
+    tip_raw = fetch_tip(session, norad_id, limit=TIP_LIMIT)
     sols_all = parse_tip_solutions(tip_raw)
     latest_batch = select_latest_tip_batch(sols_all)
     if not latest_batch:
@@ -536,27 +539,28 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
     t_center = wmin + (wmax - wmin) / 2
     lats, lons, times_dt = groundtrack_corridor(sat, t_center, WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN, STEP_SECONDS)
 
-    # Save track for Streamlit viewer
+    # Track saved as list-of-dicts for Streamlit viewer
     track = []
-    for lat, lon, tt in zip(lats, lons, times_dt):
-        track.append({"time_utc": dt_to_iso_z(tt), "lat": float(lat), "lon": float(lon)})
-    track = downsample_track(track, TRACK_MAX_POINTS)
+    min_dist = 1e18
+    min_idx = None
 
     inside_hits: List[int] = []
     near_hits: List[int] = []
 
-    min_dist = 1e18
-    min_idx = None
-
-    for i, (lat, lon) in enumerate(zip(lats, lons)):
+    for i, (lat, lon, tt) in enumerate(zip(lats, lons, times_dt)):
         d = distance_to_bbox_km(float(lat), float(lon), PH_BBOX)
         if d < min_dist:
             min_dist = d
             min_idx = i
+
         if d == 0.0:
             inside_hits.append(i)
         elif d <= PH_NEAR_KM:
             near_hits.append(i)
+
+        track.append({"time_utc": dt_to_iso_z(tt), "lat": float(lat), "lon": float(lon)})
+
+    track = downsample_track(track, TRACK_MAX_POINTS)
 
     triggered = bool(inside_hits or near_hits)
     if not triggered:
@@ -580,6 +584,7 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
         hit_type = "NEAR_PH"
 
     event_id = f"{norad_id}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
     event: Dict[str, Any] = {
         "created_utc": dt_to_iso_z(now_utc()),
         "norad_id": norad_id,
@@ -626,7 +631,6 @@ def create_dummy_event(event_id: Optional[str] = None) -> Tuple[str, Dict[str, A
     if event_id is None:
         event_id = f"dummy_66877_{t.strftime('%Y%m%d_%H%M%S')}"
 
-    # Fake track across PH
     pts = [
         (10.0, 118.0),
         (12.0, 119.5),
@@ -634,6 +638,7 @@ def create_dummy_event(event_id: Optional[str] = None) -> Tuple[str, Dict[str, A
         (16.0, 122.5),
         (18.0, 125.0),
     ]
+
     track = []
     for i in range(len(pts) - 1):
         lat1, lon1 = pts[i]
@@ -691,31 +696,28 @@ def cmd_dummy_page() -> None:
     if link:
         print("Open in Streamlit:", link)
     else:
-        print("Set VIEWER_BASE_URL to generate a viewer link, e.g. https://smcod-ssa.streamlit.app")
+        print("Set VIEWER_BASE_URL to generate a viewer link.")
 
 
 def cmd_dummy_alert() -> None:
-    if not TEAMS_WEBHOOK_URL:
-        raise SystemExit("Missing TEAMS_WEBHOOK_URL in env/.env")
-    if not VIEWER_BASE_URL:
-        raise SystemExit("Missing VIEWER_BASE_URL in env/.env (your Streamlit app base URL)")
-
     ensure_dir(OUT_DIR)
     event_id, event = create_dummy_event()
     path = write_event(OUT_DIR, event_id, event)
 
-    teams_send(event_id, event)
+    if TEAMS_WEBHOOK_URL:
+        teams_send(event_id, event)
+        print("Posted to Teams.")
+    else:
+        print("TEAMS_WEBHOOK_URL not set; skipped Teams post.")
 
     print("Dummy event saved:", path)
-    print("Posted to Teams. Link:", streamlit_event_link(event_id))
-    if not _is_workflow_url(TEAMS_WEBHOOK_URL):
-        print("NOTE: Your TEAMS_WEBHOOK_URL looks like an Incoming Webhook, so you'll get a plain message, not a Workflow card.")
-        print("      For Workflow cards, use the Workflows/Power Automate trigger URL (logic.azure.com...).")
+    if VIEWER_BASE_URL:
+        print("Viewer:", streamlit_event_link(event_id))
 
 
 def cmd_monitor() -> None:
     if not NORAD_IDS:
-        raise SystemExit("No NORAD_IDS set. Put NORAD_IDS=66877,12345 in your .env")
+        raise SystemExit("No NORAD_IDS set. Put NORAD_IDS=66877,56817 in your .env")
     if not SPACE_TRACK_USERNAME or not SPACE_TRACK_PASSWORD:
         raise SystemExit("Missing SPACE_TRACK_USERNAME / SPACE_TRACK_PASSWORD")
 
@@ -724,15 +726,15 @@ def cmd_monitor() -> None:
     session = spacetrack_login(SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD)
 
     print(f"[{dt_to_iso_z(now_utc())}] Monitor starting. NORAD_IDS={NORAD_IDS} poll={POLL_SECONDS}s near={PH_NEAR_KM}km")
-    if not TEAMS_WEBHOOK_URL:
-        print("[INFO] TEAMS_WEBHOOK_URL not set -> no Teams alerts will be sent.")
-    else:
+    if TEAMS_WEBHOOK_URL:
         if _is_workflow_url(TEAMS_WEBHOOK_URL):
-            print("[INFO] TEAMS_WEBHOOK_URL looks like Workflows/Power Automate -> Workflow cards expected.")
+            print("[INFO] Teams URL looks like Workflows/Power Automate -> Workflow card expected.")
         else:
-            print("[INFO] TEAMS_WEBHOOK_URL looks like Incoming Webhook -> plain message only (no Workflow card).")
+            print("[INFO] Teams URL looks like Incoming Webhook -> plain message only.")
+    else:
+        print("[INFO] TEAMS_WEBHOOK_URL not set -> no Teams alerts will be sent.")
     if not VIEWER_BASE_URL:
-        print("[INFO] VIEWER_BASE_URL not set -> links will be missing.")
+        print("[INFO] VIEWER_BASE_URL not set -> viewer links will be missing.")
 
     while True:
         loop_started = now_utc()
@@ -775,7 +777,7 @@ def cmd_monitor() -> None:
 # Entry
 # -----------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Reentry/TIP monitor + dummy test + Teams Workflow cards (via Flow URL).")
+    parser = argparse.ArgumentParser(description="Reentry/TIP monitor + dummy test + Teams Workflow cards via Flow URL.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("dummy-page", help="Create dummy event JSON only")
