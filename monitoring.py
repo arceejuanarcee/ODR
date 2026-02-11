@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 """
-Reentry/TIP Monitoring Pipeline + Dummy Test + Flask Viewer (ALL-IN-ONE)
+Reentry/TIP Monitoring Pipeline + Dummy Test + Flask Viewer (Map + Ground Track)
 
-✅ What you get in this single script
-1) monitor      : polls Space-Track TIP + latest TLE, checks if predicted corridor crosses/near PH, sends Teams alert
-2) dummy-alert  : creates a dummy “reentry” event JSON + posts a Teams message with clickable Flask link
-3) serve        : runs a Flask server that shows the event page at /event/<event_id>
-4) dummy-page   : creates a dummy event only (no Teams), so you can test Flask locally
+Adds:
+- Event JSON stores ground-track points (downsampled)
+- Flask viewer shows Leaflet map with:
+  - Ground track polyline
+  - Hit marker
+  - PH bbox rectangle
 
-Why this is practical
-- Your monitor creates events into OUT_DIR
-- Flask serves those events read-only
-- Teams alerts point to the Flask URL (clickable)
-
-Requirements
+Requirements:
   pip install requests skyfield python-dotenv numpy flask
 
-Optional
-  pip install simplekml  (for KML export)
-
-.env / Environment variables
-  SPACE_TRACK_USERNAME=...
-  SPACE_TRACK_PASSWORD=...
-  TEAMS_WEBHOOK_URL=...                 (optional)
-  BASE_URL=https://your-domain          (for clickable links in Teams)
-  NORAD_IDS=66877,12345                 (monitor targets)
+Env vars (optional):
+  SPACE_TRACK_USERNAME
+  SPACE_TRACK_PASSWORD
+  TEAMS_WEBHOOK_URL
+  BASE_URL
+  NORAD_IDS=66877,12345
   POLL_SECONDS=600
   PH_NEAR_KM=500
   WINDOW_BEFORE_MIN=120
@@ -35,23 +28,11 @@ Optional
   FLASK_HOST=0.0.0.0
   FLASK_PORT=8080
 
-Usage
-  # 1) Run Flask viewer (local)
-  python reentry_pipeline_full.py serve
-
-  # 2) Create a dummy event page only (no Teams)
-  python reentry_pipeline_full.py dummy-page
-
-  # 3) Create dummy event + post Teams alert with clickable link
-  python reentry_pipeline_full.py dummy-alert
-
-  # 4) Run real monitor loop (polling)
-  python reentry_pipeline_full.py monitor
-
-Tip for Teams testing
-- BASE_URL must be reachable by Teams users (not localhost).
-- For quick test: run serve locally and use a tunnel (cloudflared/ngrok) to get a public https URL,
-  then set BASE_URL to that URL.
+Usage:
+  python monitoring.py serve
+  python monitoring.py dummy-page
+  python monitoring.py dummy-alert
+  python monitoring.py monitor
 """
 
 from __future__ import annotations
@@ -75,12 +56,6 @@ from flask import Flask, abort, Response
 
 from skyfield.api import EarthSatellite, load as sf_load
 
-try:
-    import simplekml
-except Exception:
-    simplekml = None
-
-
 # -----------------------------
 # Load env + constants
 # -----------------------------
@@ -91,13 +66,8 @@ LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
 PH_TZ = dt.timezone(dt.timedelta(hours=8))
 EARTH_RADIUS_KM = 6371.0088
 
-# Operational PH bbox (quick filter)
-PH_BBOX = {
-    "lon_min": 115.0,
-    "lon_max": 130.0,
-    "lat_min": 4.0,
-    "lat_max": 22.0,
-}
+# Operational PH bbox (quick filter) — adjust if you want broader PAR
+PH_BBOX = {"lon_min": 115.0, "lon_max": 130.0, "lat_min": 4.0, "lat_max": 22.0}
 
 OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts")
 STATE_PATH = os.path.join(OUT_DIR, "state.json")
@@ -106,7 +76,7 @@ SPACE_TRACK_USERNAME = os.getenv("SPACE_TRACK_USERNAME", "").strip()
 SPACE_TRACK_PASSWORD = os.getenv("SPACE_TRACK_PASSWORD", "").strip()
 
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
-BASE_URL = os.getenv("BASE_URL", "").strip()  # used for links in Teams
+BASE_URL = os.getenv("BASE_URL", "").strip()  # for Teams clickable links
 
 DEFAULT_TIP_LIMIT = int(os.getenv("TIP_LIMIT", "200"))
 
@@ -120,6 +90,9 @@ FALLBACK_UNCERT_MIN = float(os.getenv("FALLBACK_UNCERT_MIN", "48"))
 
 FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
 FLASK_PORT = int(os.getenv("FLASK_PORT", "8080"))
+
+# For storing track in event JSON (to keep files small)
+TRACK_MAX_POINTS = int(os.getenv("TRACK_MAX_POINTS", "300"))  # downsample to <= this many points
 
 NORAD_IDS: List[int] = []
 raw_ids = os.getenv("NORAD_IDS", "").strip()
@@ -141,7 +114,7 @@ class TipSolution:
 
 
 # -----------------------------
-# Time + formatting helpers
+# Time helpers
 # -----------------------------
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -219,8 +192,19 @@ def distance_to_bbox_km(lat: float, lon: float, bbox: Dict[str, float]) -> float
     return haversine_km(lat, lon, clamped_lat, clamped_lon)
 
 
+def downsample_track(track: List[Dict[str, Any]], max_points: int) -> List[Dict[str, Any]]:
+    if max_points <= 0 or len(track) <= max_points:
+        return track
+    step = max(1, int(math.ceil(len(track) / float(max_points))))
+    out = track[::step]
+    # ensure last point included
+    if out and out[-1] is not track[-1]:
+        out.append(track[-1])
+    return out
+
+
 # -----------------------------
-# TIP uncertainty parsing (best-effort)
+# TIP uncertainty parsing
 # -----------------------------
 def parse_uncertainty_seconds(val: Any) -> Optional[float]:
     if val is None:
@@ -275,15 +259,10 @@ def parse_uncertainty_seconds(val: Any) -> Optional[float]:
 
 def tip_batch_uncertainty_seconds(latest_batch: List[TipSolution]) -> Optional[float]:
     candidate_keys = [
-        "EPOCH_UNCERTAINTY",
-        "EPOCH_UNC",
-        "DECAY_UNCERTAINTY",
-        "DECAY_UNC",
-        "DECAY_EPOCH_UNCERTAINTY",
-        "DECAY_EPOCH_UNC",
-        "WINDOW",
-        "WINDOW_WIDTH",
-        "WINDOW_MINUTES",
+        "EPOCH_UNCERTAINTY", "EPOCH_UNC",
+        "DECAY_UNCERTAINTY", "DECAY_UNC",
+        "DECAY_EPOCH_UNCERTAINTY", "DECAY_EPOCH_UNC",
+        "WINDOW", "WINDOW_WIDTH", "WINDOW_MINUTES",
     ]
     for s in latest_batch:
         raw = s.raw or {}
@@ -410,7 +389,7 @@ def compute_tip_window_from_latest_batch(
 
 
 # -----------------------------
-# Ground-track
+# Ground track
 # -----------------------------
 def groundtrack_corridor(
     sat: EarthSatellite,
@@ -437,17 +416,6 @@ def groundtrack_corridor(
     lons_raw = list(sub.longitude.degrees)
     lons = [((x + 180) % 360) - 180 for x in lons_raw]
     return lats, lons, times_dt
-
-
-def export_kml_corridor(path: str, name: str, lats: List[float], lons: List[float]) -> None:
-    if simplekml is None:
-        return
-    kml = simplekml.Kml()
-    ls = kml.newlinestring(name=name)
-    ls.coords = list(zip(lons, lats))
-    ls.altitudemode = simplekml.AltitudeMode.clamptoground
-    ls.extrude = 0
-    kml.save(path)
 
 
 # -----------------------------
@@ -502,13 +470,11 @@ def format_alert(event_id: str, event: Dict[str, Any]) -> Tuple[str, str]:
     text = (
         f"- TIP MSG_EPOCH: {event.get('tip_msg_epoch_used','')}\n"
         f"- Decay window (UTC): {w.get('start_utc','')} → {w.get('end_utc','')} (mode={w.get('mode','')})\n"
-        f"- Hit time: {hit.get('time_utc','')} | {hit.get('time_ph','')}\n"
+        f"- Closest approach: {pf.get('min_distance_time_utc','')} | {pf.get('min_distance_time_ph','')}\n"
         f"- Hit location: lat={hit.get('lat',0):.3f}, lon={hit.get('lon',0):.3f}\n"
         f"- Distance to PH bbox: {hit.get('distance_to_ph_bbox_km',0):.0f} km (near threshold={pf.get('near_km_threshold',PH_NEAR_KM):.0f} km)\n"
         f"{link_line}"
     )
-    if event.get("kml_path"):
-        text += f"\n- KML: {event['kml_path']}\n"
     return title, text
 
 
@@ -531,7 +497,7 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
 
     wmin, wmax, mode = compute_tip_window_from_latest_batch(latest_batch, FALLBACK_UNCERT_MIN)
 
-    # update seen (so we don't spam on bad windows)
+    # update seen (so we don't spam)
     state.setdefault("last_msg_epoch", {})[str(norad_id)] = latest_msg_epoch
 
     if not (wmin and wmax):
@@ -543,6 +509,12 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
 
     t_center = wmin + (wmax - wmin) / 2
     lats, lons, times_dt = groundtrack_corridor(sat, t_center, WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN, STEP_SECONDS)
+
+    # build track list for saving + map
+    track = []
+    for lat, lon, tt in zip(lats, lons, times_dt):
+        track.append({"time_utc": dt_to_iso_z(tt), "lat": float(lat), "lon": float(lon)})
+    track = downsample_track(track, TRACK_MAX_POINTS)
 
     inside_hits: List[int] = []
     near_hits: List[int] = []
@@ -597,6 +569,7 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
             "before_min": WINDOW_BEFORE_MIN,
             "after_min": WINDOW_AFTER_MIN,
             "step_seconds": STEP_SECONDS,
+            "track_points_saved": len(track),
         },
         "ph_filter": {
             "bbox": PH_BBOX,
@@ -613,23 +586,41 @@ def check_one_object(session: requests.Session, norad_id: int, state: Dict[str, 
             "lon": float(lons[idx]),
             "distance_to_ph_bbox_km": float(distance_to_bbox_km(float(lats[idx]), float(lons[idx]), PH_BBOX)),
         },
+        "track": track,  # ✅ used by Flask map
     }
-
-    if simplekml is not None:
-        kml_path = os.path.join(OUT_DIR, f"{event_id}.kml")
-        export_kml_corridor(kml_path, f"{name} corridor", lats, lons)
-        event["kml_path"] = os.path.abspath(kml_path)
 
     return event_id, event
 
 
 # -----------------------------
-# Dummy event generators
+# Dummy event generators (with fake track)
 # -----------------------------
 def create_dummy_event(event_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     t = now_utc()
     if event_id is None:
         event_id = f"dummy_66877_{t.strftime('%Y%m%d_%H%M%S')}"
+
+    # Fake track: from Palawan-ish across Luzon then out
+    pts = [
+        (10.0, 118.0),
+        (12.0, 119.5),
+        (14.6, 120.98),  # Manila-ish
+        (16.0, 122.5),
+        (18.0, 125.0),
+    ]
+    track = []
+    for i in range(len(pts) - 1):
+        lat1, lon1 = pts[i]
+        lat2, lon2 = pts[i + 1]
+        for k in range(18):
+            f = k / 18.0
+            lat = lat1 + (lat2 - lat1) * f
+            lon = lon1 + (lon2 - lon1) * f
+            tt = t - dt.timedelta(minutes=60) + dt.timedelta(minutes=6 * (i * 18 + k))
+            track.append({"time_utc": dt_to_iso_z(tt), "lat": float(lat), "lon": float(lon)})
+    track = downsample_track(track, TRACK_MAX_POINTS)
+
+    hit_lat, hit_lon = 14.5995, 120.9842
 
     event = {
         "created_utc": dt_to_iso_z(t),
@@ -652,16 +643,17 @@ def create_dummy_event(event_id: Optional[str] = None) -> Tuple[str, Dict[str, A
             "type": "CROSSES_PH",
             "time_utc": dt_to_iso_z(t),
             "time_ph": dt_to_iso_ph(t),
-            "lat": 14.5995,   # Manila-ish
-            "lon": 120.9842,
+            "lat": hit_lat,
+            "lon": hit_lon,
             "distance_to_ph_bbox_km": 0.0,
         },
+        "track": track,  # ✅ used by Flask map
     }
     return event_id, event
 
 
 # -----------------------------
-# Flask Viewer
+# Flask Viewer (Leaflet Map)
 # -----------------------------
 def render_event_html(event_id: str, event: Dict[str, Any]) -> str:
     hit = event.get("hit", {})
@@ -669,43 +661,110 @@ def render_event_html(event_id: str, event: Dict[str, Any]) -> str:
     obj = event.get("object_name", "")
     norad = event.get("norad_id", "")
 
-    # Lightweight, Teams-friendly HTML with OG tags (preview-friendly if public HTTPS)
+    track = event.get("track", []) or []
+    # Convert to [[lat, lon], ...] for Leaflet
+    poly = [[p.get("lat"), p.get("lon")] for p in track if "lat" in p and "lon" in p]
+    poly_json = json.dumps(poly)
+
+    ph = event.get("ph_filter", {}).get("bbox", PH_BBOX)
+    # Leaflet rectangle bounds: [[southWest],[northEast]] in lat/lon
+    ph_bounds = [[ph["lat_min"], ph["lon_min"]], [ph["lat_max"], ph["lon_max"]]]
+    ph_bounds_json = json.dumps(ph_bounds)
+
+    hit_lat = float(hit.get("lat", 0.0) or 0.0)
+    hit_lon = float(hit.get("lon", 0.0) or 0.0)
+    hit_json = json.dumps([hit_lat, hit_lon])
+
+    # Basic view: PH region
+    default_center = [12.5, 122.0]
+    if poly:
+        default_center = poly[len(poly) // 2]
+    center_json = json.dumps(default_center)
+
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>Reentry Alert — NORAD {norad}</title>
-  <meta property="og:title" content="Reentry Alert — NORAD {norad}" />
-  <meta property="og:description" content="{hit.get('type','')} | {obj}" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet (CDN) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 24px; }}
-    .card {{ max-width: 820px; border: 1px solid #ddd; border-radius: 12px; padding: 18px; }}
-    h1 {{ margin: 0 0 6px 0; font-size: 22px; }}
+    body {{ font-family: Arial, sans-serif; margin: 18px; }}
+    .wrap {{ max-width: 1000px; }}
+    .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 16px; }}
+    h1 {{ margin: 0 0 8px 0; font-size: 22px; }}
     .muted {{ color: #666; }}
+    #map {{ height: 520px; border-radius: 12px; margin-top: 12px; border: 1px solid #ddd; }}
     pre {{ background: #f6f6f6; padding: 12px; border-radius: 8px; overflow-x: auto; }}
-    .row {{ margin: 10px 0; }}
+    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    @media (max-width: 760px) {{ .grid {{ grid-template-columns: 1fr; }} }}
     .tag {{ display: inline-block; padding: 4px 10px; border-radius: 999px; background: #eee; font-size: 12px; }}
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Reentry/TIP Event</h1>
-    <div class="muted">Event ID: <b>{event_id}</b></div>
+  <div class="wrap">
+    <div class="card">
+      <h1>Reentry / TIP Event</h1>
+      <div class="muted">Event ID: <b>{event_id}</b></div>
+      <div style="margin-top:8px;"><span class="tag">{hit.get("type","")}</span></div>
 
-    <div class="row"><span class="tag">{hit.get('type','')}</span></div>
+      <div class="grid" style="margin-top:12px;">
+        <div><b>Object:</b> {obj} (NORAD {norad})</div>
+        <div><b>TIP MSG_EPOCH:</b> {event.get("tip_msg_epoch_used","")}</div>
+        <div><b>Decay window (UTC):</b> {w.get("start_utc","")} → {w.get("end_utc","")} <span class="muted">(mode={w.get("mode","")})</span></div>
+        <div><b>Hit time:</b> {hit.get("time_utc","")} | {hit.get("time_ph","")}</div>
+        <div><b>Hit location:</b> lat={hit_lat:.4f}, lon={hit_lon:.4f}</div>
+        <div><b>Track points saved:</b> {len(poly)}</div>
+      </div>
 
-    <div class="row"><b>Object:</b> {obj} (NORAD {norad})</div>
-    <div class="row"><b>TIP MSG_EPOCH:</b> {event.get('tip_msg_epoch_used','')}</div>
+      <div id="map"></div>
 
-    <div class="row"><b>Decay window (UTC):</b> {w.get('start_utc','')} → {w.get('end_utc','')} <span class="muted">(mode={w.get('mode','')})</span></div>
-
-    <div class="row"><b>Hit time:</b> {hit.get('time_utc','')} | {hit.get('time_ph','')}</div>
-    <div class="row"><b>Hit location:</b> lat={hit.get('lat',0):.4f}, lon={hit.get('lon',0):.4f} <span class="muted">(dist={hit.get('distance_to_ph_bbox_km',0):.0f} km)</span></div>
-
-    <div class="row"><b>Raw JSON:</b></div>
-    <pre>{json.dumps(event, indent=2)}</pre>
+      <div style="margin-top: 14px;"><b>Raw JSON:</b></div>
+      <pre>{json.dumps(event, indent=2)}</pre>
+    </div>
   </div>
+
+<script>
+  const poly = {poly_json};
+  const phBounds = {ph_bounds_json};
+  const hit = {hit_json};
+  const center = {center_json};
+
+  const map = L.map('map').setView(center, 5);
+
+  // OSM tiles
+  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+    maxZoom: 10,
+    attribution: '&copy; OpenStreetMap contributors'
+  }}).addTo(map);
+
+  // PH bbox
+  const rect = L.rectangle(phBounds, {{color: '#ff7800', weight: 2, fillOpacity: 0.0}});
+  rect.addTo(map);
+
+  // Track
+  if (poly.length >= 2) {{
+    const line = L.polyline(poly, {{color: '#1f77b4', weight: 3, opacity: 0.9}});
+    line.addTo(map);
+    map.fitBounds(line.getBounds().pad(0.2));
+  }} else {{
+    map.fitBounds(rect.getBounds().pad(0.2));
+  }}
+
+  // Hit marker
+  if (hit[0] !== 0 || hit[1] !== 0) {{
+    const m = L.circleMarker(hit, {{radius: 7, color: '#d62728', weight: 2, fillOpacity: 0.8}});
+    m.addTo(map);
+    m.bindPopup("Hit / closest point");
+  }}
+</script>
+
 </body>
 </html>"""
 
@@ -717,7 +776,7 @@ def make_flask_app() -> Flask:
     def index():
         return Response(
             "<h3>Reentry Event Viewer</h3><p>Use /event/&lt;event_id&gt;</p>",
-            mimetype="text/html"
+            mimetype="text/html",
         )
 
     @app.route("/event/<event_id>")
@@ -752,7 +811,7 @@ def cmd_dummy_page() -> None:
     event_id, event = create_dummy_event()
     path = write_event(OUT_DIR, event_id, event)
     print("Dummy event saved:", path)
-    print(f"Open (local): http://{FLASK_HOST}:{FLASK_PORT}/event/{event_id}")
+    print(f"Open: http://127.0.0.1:{FLASK_PORT}/event/{event_id}")
 
 
 def cmd_dummy_alert() -> None:
@@ -770,13 +829,15 @@ def cmd_dummy_alert() -> None:
 
     print("Dummy event saved:", path)
     print("Teams alert posted. Link:", f"{BASE_URL.rstrip('/')}/event/{event_id}")
+    print("Local open (if serving locally):", f"http://127.0.0.1:{FLASK_PORT}/event/{event_id}")
+    print("Saved:", path)
 
 
 def cmd_serve() -> None:
     ensure_dir(OUT_DIR)
     app = make_flask_app()
     print(f"Serving OUT_DIR={OUT_DIR}")
-    print(f"Open: http://{FLASK_HOST}:{FLASK_PORT}/")
+    print(f"Open: http://127.0.0.1:{FLASK_PORT}/")
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False)
 
 
@@ -819,7 +880,6 @@ def cmd_monitor() -> None:
 
         except Exception as e:
             print(f"[WARN] Loop error: {e}")
-            # re-login once
             try:
                 session = spacetrack_login(SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD)
                 print("[INFO] Re-logged in to Space-Track.")
@@ -835,7 +895,7 @@ def cmd_monitor() -> None:
 # Entry
 # -----------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Reentry/TIP monitor + dummy test + Flask viewer (single script).")
+    parser = argparse.ArgumentParser(description="Reentry/TIP monitor + dummy test + Flask viewer (Map + Track).")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("serve", help="Run Flask viewer at /event/<event_id>")
