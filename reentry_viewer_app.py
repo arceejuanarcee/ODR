@@ -1,31 +1,37 @@
 import os
 import json
-import glob
 import datetime as dt
+from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
 
+# Dropbox (optional)
+try:
+    import dropbox
+    from dropbox.exceptions import ApiError, AuthError
+except Exception:
+    dropbox = None
+    ApiError = None
+    AuthError = None
+
 # ---- Config
 st.set_page_config(page_title="Reentry Event Viewer", layout="wide")
 
-OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts")
+# If you still want a local fallback directory:
+OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts").strip()
+
+# Dropbox config
+DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
+DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER", "/reentry_alerts").strip()  # where your monitor uploads JSONs
+DROPBOX_MAX_FILES = int(os.getenv("DROPBOX_MAX_FILES", "200"))  # limit listing for performance
 
 PH_BBOX_DEFAULT = {"lon_min": 115.0, "lon_max": 130.0, "lat_min": 4.0, "lat_max": 22.0}
 
 # -----------------------------
-# Helpers
+# Helpers (shared)
 # -----------------------------
-def load_event(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def list_events(out_dir: str):
-    files = sorted(glob.glob(os.path.join(out_dir, "*.json")), reverse=True)
-    files = [p for p in files if os.path.basename(p).lower() != "state.json"]
-    return files
-
 def nice_ts(s: str) -> str:
     try:
         s = s.replace("Z", "").strip()
@@ -35,70 +41,240 @@ def nice_ts(s: str) -> str:
         return s
 
 def normalize_lon(lon: float) -> float:
-    # normalize to [-180, 180)
     return ((lon + 180.0) % 360.0) - 180.0
 
 def split_dateline_segments(points, jump_deg=180.0):
-    """
-    points: list of (lat, lon)
-    Splits into segments when lon jumps big (crosses dateline).
-    """
     if not points:
         return []
-
     segs = []
     cur = [points[0]]
-
     for i in range(1, len(points)):
         lat, lon = points[i]
         prev_lat, prev_lon = points[i - 1]
         if abs(lon - prev_lon) > jump_deg:
-            # break segment
             if len(cur) >= 2:
                 segs.append(cur)
             cur = [(lat, lon)]
         else:
             cur.append((lat, lon))
-
     if len(cur) >= 2:
         segs.append(cur)
-
     return segs
+
+# -----------------------------
+# Local file helpers (fallback)
+# -----------------------------
+def load_event_local(path: str) -> Dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def list_events_local(out_dir: str) -> List[str]:
+    import glob
+    files = sorted(glob.glob(os.path.join(out_dir, "*.json")), reverse=True)
+    files = [p for p in files if os.path.basename(p).lower() != "state.json"]
+    return files
+
+# -----------------------------
+# Dropbox helpers
+# -----------------------------
+@st.cache_resource
+def get_dbx(token: str):
+    if not dropbox:
+        return None
+    if not token:
+        return None
+    return dropbox.Dropbox(token)
+
+def _is_dropbox_ready() -> Tuple[bool, str]:
+    if not DROPBOX_ACCESS_TOKEN:
+        return False, "Missing DROPBOX_ACCESS_TOKEN"
+    if not dropbox:
+        return False, "Dropbox SDK not installed. Run: pip install dropbox"
+    return True, "OK"
+
+@st.cache_data(ttl=60, show_spinner=False)
+def dropbox_list_json_files(token: str, folder: str, max_files: int) -> List[Dict[str, str]]:
+    """
+    Returns list of dicts:
+      { "path": "/reentry_alerts/xxx.json", "name": "xxx.json", "server_modified": "...ISO...", "size": "..." }
+    Only JSON files, excluding state.json.
+    """
+    dbx = get_dbx(token)
+    if dbx is None:
+        return []
+
+    # Normalize folder: must start with /
+    if not folder.startswith("/"):
+        folder = "/" + folder
+    folder = folder.rstrip("/") or "/"
+
+    out: List[Dict[str, str]] = []
+
+    try:
+        res = dbx.files_list_folder(folder, recursive=False)
+        while True:
+            for entry in res.entries:
+                # We only care about files
+                if isinstance(entry, dropbox.files.FileMetadata):
+                    name = entry.name or ""
+                    if not name.lower().endswith(".json"):
+                        continue
+                    if name.lower() == "state.json":
+                        continue
+                    out.append(
+                        {
+                            "path": entry.path_lower or entry.path_display or "",
+                            "name": entry.name,
+                            "server_modified": entry.server_modified.isoformat() if entry.server_modified else "",
+                            "size": str(entry.size),
+                        }
+                    )
+            if res.has_more:
+                res = dbx.files_list_folder_continue(res.cursor)
+            else:
+                break
+    except AuthError as e:
+        # This commonly happens with missing scopes (files.metadata.read, files.content.read)
+        raise RuntimeError(f"Dropbox AuthError: {e}")
+    except ApiError as e:
+        raise RuntimeError(f"Dropbox ApiError: {e}")
+
+    # Sort newest first by server_modified (string ISO is sortable enough here)
+    out.sort(key=lambda x: x.get("server_modified", ""), reverse=True)
+    if max_files > 0:
+        out = out[: max_files]
+    return out
+
+@st.cache_data(ttl=60, show_spinner=False)
+def dropbox_download_json(token: str, path: str) -> Dict:
+    """
+    Downloads JSON file from Dropbox and returns parsed dict.
+    """
+    dbx = get_dbx(token)
+    if dbx is None:
+        raise RuntimeError("Dropbox client unavailable.")
+
+    try:
+        md, resp = dbx.files_download(path)
+        data = resp.content.decode("utf-8")
+        return json.loads(data)
+    except AuthError as e:
+        raise RuntimeError(f"Dropbox AuthError: {e}")
+    except ApiError as e:
+        raise RuntimeError(f"Dropbox ApiError: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to download/parse JSON from Dropbox: {e}")
 
 # -----------------------------
 # UI
 # -----------------------------
 st.title("Reentry Event Viewer (PH)")
-st.caption(f"Reading events from: `{os.path.abspath(OUT_DIR)}`")
 
-files = list_events(OUT_DIR)
-if not files:
-    st.warning("No event JSON files found. Run your monitor or dummy generator first.")
-    st.stop()
+# Choose source
+ready, why = _is_dropbox_ready()
+use_dropbox_default = bool(ready)
 
-labels = []
-for p in files:
+source = st.radio(
+    "Event source",
+    ["Dropbox", "Local folder"],
+    index=0 if use_dropbox_default else 1,
+    horizontal=True,
+)
+
+if source == "Dropbox":
+    if not ready:
+        st.warning(
+            f"Dropbox not ready: **{why}**\n\n"
+            f"To use Dropbox, set `DROPBOX_ACCESS_TOKEN` and install SDK: `pip install dropbox`.\n"
+            f"Also make sure your token has scopes: **files.metadata.read** and **files.content.read** "
+            f"(and write scopes if your monitor uploads)."
+        )
+        st.stop()
+
+    st.caption(f"Reading events from Dropbox folder: `{DROPBOX_FOLDER}`")
+
+    # Quick token sanity check button
+    with st.expander("Dropbox connection", expanded=False):
+        if st.button("Test Dropbox token"):
+            try:
+                dbx = get_dbx(DROPBOX_ACCESS_TOKEN)
+                acct = dbx.users_get_current_account()
+                st.success(f"OK: {acct.name.display_name}")
+            except Exception as e:
+                st.error(str(e))
+
     try:
-        e = load_event(p)
-        eid = os.path.splitext(os.path.basename(p))[0]
-        name = e.get("object_name", "")
-        norad = e.get("norad_id", "")
-        created = nice_ts(e.get("created_utc", ""))
-        labels.append((f"{created} | {name} (NORAD {norad}) | {eid}", p))
-    except Exception:
-        labels.append((os.path.basename(p), p))
+        files_meta = dropbox_list_json_files(DROPBOX_ACCESS_TOKEN, DROPBOX_FOLDER, DROPBOX_MAX_FILES)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-label_to_path = {lab: path for lab, path in labels}
+    if not files_meta:
+        st.warning("No event JSON files found in Dropbox folder. Run your monitor first.")
+        st.stop()
 
-selected_label = st.selectbox("Select an event", list(label_to_path.keys()), index=0)
-event_path = label_to_path[selected_label]
+    labels: List[Tuple[str, str]] = []
+    for fm in files_meta:
+        path = fm["path"]
+        name = fm["name"]
+        # Use file name (event_id) when possible
+        eid = os.path.splitext(name)[0]
+        # We'll lazily load event only after selection (fast listing)
+        # Still build a decent label from metadata
+        mod = fm.get("server_modified", "")
+        try:
+            mod_label = dt.datetime.fromisoformat(mod.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S UTC") if mod else ""
+        except Exception:
+            mod_label = mod
+        labels.append((f"{mod_label} | {eid}", path))
 
-event = load_event(event_path)
-event_id = os.path.splitext(os.path.basename(event_path))[0]
+    label_to_path = {lab: path for lab, path in labels}
+    selected_label = st.selectbox("Select an event", list(label_to_path.keys()), index=0)
+    event_path = label_to_path[selected_label]
 
-hit = event.get("hit", {})
-decay = event.get("decay_window", {})
-ph_bbox = event.get("ph_filter", {}).get("bbox", PH_BBOX_DEFAULT)
+    # Load event JSON from Dropbox
+    try:
+        event = dropbox_download_json(DROPBOX_ACCESS_TOKEN, event_path)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+    # Derive event_id from file name
+    event_id = os.path.splitext(os.path.basename(event_path))[0]
+
+else:
+    st.caption(f"Reading events from local folder: `{os.path.abspath(OUT_DIR)}`")
+
+    files = list_events_local(OUT_DIR)
+    if not files:
+        st.warning("No event JSON files found locally. Run your monitor or dummy generator first.")
+        st.stop()
+
+    labels = []
+    for p in files:
+        try:
+            e = load_event_local(p)
+            eid = os.path.splitext(os.path.basename(p))[0]
+            name = e.get("object_name", "")
+            norad = e.get("norad_id", "")
+            created = nice_ts(e.get("created_utc", ""))
+            labels.append((f"{created} | {name} (NORAD {norad}) | {eid}", p))
+        except Exception:
+            labels.append((os.path.basename(p), p))
+
+    label_to_path = {lab: path for lab, path in labels}
+    selected_label = st.selectbox("Select an event", list(label_to_path.keys()), index=0)
+    event_path = label_to_path[selected_label]
+
+    event = load_event_local(event_path)
+    event_id = os.path.splitext(os.path.basename(event_path))[0]
+
+# -----------------------------
+# Event summary
+# -----------------------------
+hit = event.get("hit", {}) or {}
+decay = event.get("decay_window", {}) or {}
+ph_bbox = (event.get("ph_filter", {}) or {}).get("bbox", PH_BBOX_DEFAULT)
 
 col1, col2, col3 = st.columns([1.2, 1.2, 1.6])
 
@@ -120,16 +296,16 @@ with col3:
     st.write(f"Type: **{hit.get('type','')}**")
     st.write(f"Time UTC: `{hit.get('time_utc','')}`")
     st.write(f"Time PH: `{hit.get('time_ph','')}`")
-    st.write(f"Lat/Lon: **{float(hit.get('lat',0.0)):.4f}, {float(hit.get('lon',0.0)):.4f}**")
-    st.write(f"Distance to PH bbox: **{float(hit.get('distance_to_ph_bbox_km',0.0)):.0f} km**")
+    st.write(f"Lat/Lon: **{float(hit.get('lat',0.0) or 0.0):.4f}, {float(hit.get('lon',0.0) or 0.0):.4f}**")
+    st.write(f"Distance to PH bbox: **{float(hit.get('distance_to_ph_bbox_km',0.0) or 0.0):.0f} km**")
 
 st.divider()
 
 # -----------------------------
-# Ground track plotting (FIXED)
+# Ground track plotting
 # -----------------------------
 track = event.get("track", []) or []
-# normalize lon to avoid weirdness, and keep only valid points
+
 poly = []
 for p in track:
     if "lat" in p and "lon" in p:
@@ -145,9 +321,7 @@ if len(poly) < 2:
     st.stop()
 
 segments = split_dateline_segments(poly, jump_deg=180.0)
-
-# Center map (use middle point)
-center = poly[len(poly)//2]
+center = poly[len(poly) // 2]
 
 m = folium.Map(location=center, zoom_start=5, control_scale=True)
 
@@ -156,17 +330,22 @@ sw = (ph_bbox["lat_min"], ph_bbox["lon_min"])
 ne = (ph_bbox["lat_max"], ph_bbox["lon_max"])
 folium.Rectangle(bounds=[sw, ne], color="#ff7800", weight=2, fill=False).add_to(m)
 
-# Draw each segment separately (prevents dateline wrap line)
+# Draw segments
 for seg in segments:
     folium.PolyLine(seg, color="#1f77b4", weight=4, opacity=0.9).add_to(m)
 
 # Hit marker
 hit_lat = float(hit.get("lat", 0.0) or 0.0)
 hit_lon = normalize_lon(float(hit.get("lon", 0.0) or 0.0))
-folium.CircleMarker(location=(hit_lat, hit_lon), radius=7, color="#d62728",
-                    fill=True, fill_opacity=0.85).add_to(m)
+folium.CircleMarker(
+    location=(hit_lat, hit_lon),
+    radius=7,
+    color="#d62728",
+    fill=True,
+    fill_opacity=0.85,
+).add_to(m)
 
-# Fit bounds safely across segments by using overall min/max lat/lon after normalization
+# Fit bounds
 lats = [p[0] for p in poly]
 lons = [p[1] for p in poly]
 m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
