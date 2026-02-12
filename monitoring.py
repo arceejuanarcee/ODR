@@ -526,45 +526,69 @@ def teams_send(event_id: str, event: Dict[str, Any]) -> None:
 
 
 # -----------------------------
-# Google Drive helpers
+# Dropbox helpers (replaces Google Drive completely)
 # -----------------------------
-def _drive_enabled() -> bool:
-    return bool(GDRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_FILE and service_account and build and MediaFileUpload)
+
+try:
+    import dropbox
+    from dropbox.files import WriteMode
+except Exception:
+    dropbox = None
+    WriteMode = None
 
 
-def drive_service():
-    if not _drive_enabled():
+DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
+DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER", "/reentry_alerts").strip()
+
+
+def _dropbox_enabled() -> bool:
+    return bool(DROPBOX_ACCESS_TOKEN and dropbox)
+
+
+def dropbox_client():
+    if not _dropbox_enabled():
         return None
-    scopes = ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive.metadata"]
-    creds = service_account.Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
 
 
 def drive_upload_json(local_path: str, filename: str) -> Optional[str]:
     """
-    Uploads JSON file to Google Drive folder. Returns fileId.
+    Replaces Google Drive upload.
+    Uploads JSON to Dropbox.
+    Returns Dropbox path as file_id equivalent.
     """
-    if not _drive_enabled():
+    if not _dropbox_enabled():
         return None
 
-    svc = drive_service()
-    if svc is None:
+    dbx = dropbox_client()
+    if dbx is None:
         return None
 
-    media = MediaFileUpload(local_path, mimetype="application/json", resumable=False)
-    body = {"name": filename, "parents": [GDRIVE_FOLDER_ID]}
-    created = svc.files().create(body=body, media_body=media, fields="id").execute()
-    return created.get("id")
+    dropbox_path = f"{DROPBOX_FOLDER}/{filename}"
+
+    with open(local_path, "rb") as f:
+        dbx.files_upload(
+            f.read(),
+            dropbox_path,
+            mode=WriteMode.overwrite
+        )
+
+    return dropbox_path
 
 
 def drive_delete_file(file_id: str) -> bool:
-    if not _drive_enabled():
+    """
+    Deletes file from Dropbox (file_id is Dropbox path).
+    """
+    if not _dropbox_enabled():
         return False
-    svc = drive_service()
-    if svc is None:
+
+    dbx = dropbox_client()
+    if dbx is None:
         return False
+
     try:
-        svc.files().delete(fileId=file_id).execute()
+        dbx.files_delete_v2(file_id)
         return True
     except Exception:
         return False
@@ -572,31 +596,44 @@ def drive_delete_file(file_id: str) -> bool:
 
 def drive_list_old_files_older_than(days: int) -> List[Dict[str, str]]:
     """
-    Lists files in folder older than N days by createdTime.
-    Returns list of {id, name, createdTime}.
+    Lists Dropbox files older than N days.
     """
-    if not _drive_enabled():
-        return []
-    svc = drive_service()
-    if svc is None:
+    if not _dropbox_enabled():
         return []
 
-    cutoff = (now_utc() - dt.timedelta(days=int(days))).strftime("%Y-%m-%dT%H:%M:%SZ")
-    q = f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false and createdTime < '{cutoff}'"
-    out: List[Dict[str, str]] = []
-    page_token = None
-    while True:
-        resp = svc.files().list(
-            q=q,
-            fields="nextPageToken, files(id,name,createdTime)",
-            pageToken=page_token,
-            pageSize=1000
-        ).execute()
-        out.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return out
+    dbx = dropbox_client()
+    if dbx is None:
+        return []
+
+    cutoff = now_utc() - dt.timedelta(days=int(days))
+    results = []
+
+    try:
+        resp = dbx.files_list_folder(DROPBOX_FOLDER)
+        entries = resp.entries
+
+        while resp.has_more:
+            resp = dbx.files_list_folder_continue(resp.cursor)
+            entries.extend(resp.entries)
+
+        for e in entries:
+            if isinstance(e, dropbox.files.FileMetadata):
+                server_time = e.server_modified.replace(tzinfo=dt.timezone.utc)
+                if server_time < cutoff:
+                    results.append({
+                        "id": e.path_lower,
+                        "name": e.name
+                    })
+
+    except Exception:
+        return []
+
+    return results
+
+def _drive_enabled() -> bool:
+    return _dropbox_enabled()
+
+
 
 
 # -----------------------------
