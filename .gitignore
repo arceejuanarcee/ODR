@@ -1,3 +1,6 @@
 /.env
 
 smcod-ssa-d1cfc37940a7.json
+
+/dist
+/build
