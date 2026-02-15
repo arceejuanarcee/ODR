@@ -23,7 +23,14 @@ st.set_page_config(page_title="Reentry Event Viewer", layout="wide")
 OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts").strip()
 
 # Dropbox config
+# OLD (short-lived): DROPBOX_ACCESS_TOKEN
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
+
+# NEW (long-term): refresh token flow
+DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "").strip()
+DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "").strip()
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "").strip()
+
 DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER", "/reentry_alerts").strip()  # where your monitor uploads JSONs
 DROPBOX_MAX_FILES = int(os.getenv("DROPBOX_MAX_FILES", "200"))  # limit listing for performance
 
@@ -78,28 +85,59 @@ def list_events_local(out_dir: str) -> List[str]:
 # Dropbox helpers
 # -----------------------------
 @st.cache_resource
-def get_dbx(token: str):
+def get_dbx(access_token: str, app_key: str, app_secret: str, refresh_token: str):
+    """
+    Creates a Dropbox client.
+    Priority:
+      1) Refresh-token flow (recommended)
+      2) Access-token flow (fallback)
+    """
     if not dropbox:
         return None
-    if not token:
-        return None
-    return dropbox.Dropbox(token)
+
+    # Preferred: refresh token (long-term)
+    if refresh_token and app_key and app_secret:
+        return dropbox.Dropbox(
+            oauth2_refresh_token=refresh_token,
+            app_key=app_key,
+            app_secret=app_secret,
+        )
+
+    # Fallback: short-lived access token
+    if access_token:
+        return dropbox.Dropbox(access_token)
+
+    return None
 
 def _is_dropbox_ready() -> Tuple[bool, str]:
-    if not DROPBOX_ACCESS_TOKEN:
-        return False, "Missing DROPBOX_ACCESS_TOKEN"
     if not dropbox:
         return False, "Dropbox SDK not installed. Run: pip install dropbox"
-    return True, "OK"
+
+    # Prefer refresh token config
+    if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
+        return True, "OK (refresh token)"
+
+    # Allow legacy access token as fallback
+    if DROPBOX_ACCESS_TOKEN:
+        return True, "OK (access token - may expire)"
+
+    return False, "Missing Dropbox credentials. Set DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN (recommended)."
 
 @st.cache_data(ttl=60, show_spinner=False)
-def dropbox_list_json_files(token: str, folder: str, max_files: int) -> List[Dict[str, str]]:
+def dropbox_list_json_files(
+    access_token: str,
+    app_key: str,
+    app_secret: str,
+    refresh_token: str,
+    folder: str,
+    max_files: int
+) -> List[Dict[str, str]]:
     """
     Returns list of dicts:
       { "path": "/reentry_alerts/xxx.json", "name": "xxx.json", "server_modified": "...ISO...", "size": "..." }
     Only JSON files, excluding state.json.
     """
-    dbx = get_dbx(token)
+    dbx = get_dbx(access_token, app_key, app_secret, refresh_token)
     if dbx is None:
         return []
 
@@ -114,7 +152,6 @@ def dropbox_list_json_files(token: str, folder: str, max_files: int) -> List[Dic
         res = dbx.files_list_folder(folder, recursive=False)
         while True:
             for entry in res.entries:
-                # We only care about files
                 if isinstance(entry, dropbox.files.FileMetadata):
                     name = entry.name or ""
                     if not name.lower().endswith(".json"):
@@ -134,23 +171,27 @@ def dropbox_list_json_files(token: str, folder: str, max_files: int) -> List[Dic
             else:
                 break
     except AuthError as e:
-        # This commonly happens with missing scopes (files.metadata.read, files.content.read)
         raise RuntimeError(f"Dropbox AuthError: {e}")
     except ApiError as e:
         raise RuntimeError(f"Dropbox ApiError: {e}")
 
-    # Sort newest first by server_modified (string ISO is sortable enough here)
     out.sort(key=lambda x: x.get("server_modified", ""), reverse=True)
     if max_files > 0:
         out = out[: max_files]
     return out
 
 @st.cache_data(ttl=60, show_spinner=False)
-def dropbox_download_json(token: str, path: str) -> Dict:
+def dropbox_download_json(
+    access_token: str,
+    app_key: str,
+    app_secret: str,
+    refresh_token: str,
+    path: str
+) -> Dict:
     """
     Downloads JSON file from Dropbox and returns parsed dict.
     """
-    dbx = get_dbx(token)
+    dbx = get_dbx(access_token, app_key, app_secret, refresh_token)
     if dbx is None:
         raise RuntimeError("Dropbox client unavailable.")
 
@@ -185,26 +226,33 @@ if source == "Dropbox":
     if not ready:
         st.warning(
             f"Dropbox not ready: **{why}**\n\n"
-            f"To use Dropbox, set `DROPBOX_ACCESS_TOKEN` and install SDK: `pip install dropbox`.\n"
-            f"Also make sure your token has scopes: **files.metadata.read** and **files.content.read** "
-            f"(and write scopes if your monitor uploads)."
+            f"Recommended (no expiry): set **DROPBOX_APP_KEY**, **DROPBOX_APP_SECRET**, **DROPBOX_REFRESH_TOKEN**.\n"
+            f"Fallback: set **DROPBOX_ACCESS_TOKEN** (will expire).\n"
+            f"Also ensure scopes include **files.metadata.read** and **files.content.read**."
         )
         st.stop()
 
-    st.caption(f"Reading events from Dropbox folder: `{DROPBOX_FOLDER}`")
+    mode_label = "refresh token" if (DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET) else "access token"
+    st.caption(f"Reading events from Dropbox folder: `{DROPBOX_FOLDER}` (auth: {mode_label})")
 
-    # Quick token sanity check button
     with st.expander("Dropbox connection", expanded=False):
-        if st.button("Test Dropbox token"):
+        if st.button("Test Dropbox connection"):
             try:
-                dbx = get_dbx(DROPBOX_ACCESS_TOKEN)
+                dbx = get_dbx(DROPBOX_ACCESS_TOKEN, DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN)
                 acct = dbx.users_get_current_account()
                 st.success(f"OK: {acct.name.display_name}")
             except Exception as e:
                 st.error(str(e))
 
     try:
-        files_meta = dropbox_list_json_files(DROPBOX_ACCESS_TOKEN, DROPBOX_FOLDER, DROPBOX_MAX_FILES)
+        files_meta = dropbox_list_json_files(
+            DROPBOX_ACCESS_TOKEN,
+            DROPBOX_APP_KEY,
+            DROPBOX_APP_SECRET,
+            DROPBOX_REFRESH_TOKEN,
+            DROPBOX_FOLDER,
+            DROPBOX_MAX_FILES
+        )
     except Exception as e:
         st.error(str(e))
         st.stop()
@@ -217,10 +265,7 @@ if source == "Dropbox":
     for fm in files_meta:
         path = fm["path"]
         name = fm["name"]
-        # Use file name (event_id) when possible
         eid = os.path.splitext(name)[0]
-        # We'll lazily load event only after selection (fast listing)
-        # Still build a decent label from metadata
         mod = fm.get("server_modified", "")
         try:
             mod_label = dt.datetime.fromisoformat(mod.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S UTC") if mod else ""
@@ -232,14 +277,18 @@ if source == "Dropbox":
     selected_label = st.selectbox("Select an event", list(label_to_path.keys()), index=0)
     event_path = label_to_path[selected_label]
 
-    # Load event JSON from Dropbox
     try:
-        event = dropbox_download_json(DROPBOX_ACCESS_TOKEN, event_path)
+        event = dropbox_download_json(
+            DROPBOX_ACCESS_TOKEN,
+            DROPBOX_APP_KEY,
+            DROPBOX_APP_SECRET,
+            DROPBOX_REFRESH_TOKEN,
+            event_path
+        )
     except Exception as e:
         st.error(str(e))
         st.stop()
 
-    # Derive event_id from file name
     event_id = os.path.splitext(os.path.basename(event_path))[0]
 
 else:

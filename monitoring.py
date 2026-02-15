@@ -1,38 +1,5 @@
 #!/usr/bin/env python3
-"""
-Reentry/TIP Monitoring Pipeline + Teams Workflow + Google Drive archive + housekeeping
 
-✅ Fetches latest TIP batch (orderby MSG_EPOCH desc)
-✅ Generates a ground track corridor around window center
-✅ Writes event JSON locally
-✅ Uploads event JSON to Google Drive folder (service account)
-✅ Deletes old JSONs (>RETENTION_DAYS) locally AND on Drive
-✅ Sends Teams payload to Workflow/Power Automate trigger URL (recommended)
-
-Env (.env):
-  SPACE_TRACK_USERNAME=
-  SPACE_TRACK_PASSWORD=
-  NORAD_IDS=66877,56817
-  TEAMS_WEBHOOK_URL=...        # Workflow trigger URL preferred
-  VIEWER_BASE_URL=https://smcod-ssa.streamlit.app
-  OUT_DIR=./reentry_alerts
-
-Google Drive (recommended for Task Scheduler):
-  GDRIVE_FOLDER_ID=...
-  GOOGLE_SERVICE_ACCOUNT_FILE=C:\\path\\service_account.json
-
-Housekeeping:
-  RETENTION_DAYS=21
-
-Optional tuning:
-  TIP_LIMIT=200
-  PH_NEAR_KM=500
-  WINDOW_BEFORE_MIN=120
-  WINDOW_AFTER_MIN=120
-  STEP_SECONDS=30
-  FALLBACK_UNCERT_MIN=48
-  TRACK_MAX_POINTS=300
-"""
 
 from __future__ import annotations
 
@@ -545,10 +512,23 @@ def _dropbox_enabled() -> bool:
     return bool(DROPBOX_ACCESS_TOKEN and dropbox)
 
 
+import dropbox
+import os
+
 def dropbox_client():
-    if not _dropbox_enabled():
-        return None
-    return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+    app_key = os.getenv("DROPBOX_APP_KEY", "").strip()
+    app_secret = os.getenv("DROPBOX_APP_SECRET", "").strip()
+    refresh_token = os.getenv("DROPBOX_REFRESH_TOKEN", "").strip()
+
+    if not (app_key and app_secret and refresh_token):
+        raise RuntimeError("Missing DROPBOX_APP_KEY / DROPBOX_APP_SECRET / DROPBOX_REFRESH_TOKEN")
+
+    return dropbox.Dropbox(
+        oauth2_refresh_token=refresh_token,
+        app_key=app_key,
+        app_secret=app_secret,
+    )
+
 
 
 def drive_upload_json(local_path: str, filename: str) -> Optional[str]:
