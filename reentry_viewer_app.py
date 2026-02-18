@@ -19,7 +19,6 @@ except Exception:
 # ---- Config
 st.set_page_config(page_title="Reentry Event Viewer", layout="wide")
 
-# If you still want a local fallback directory:
 OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts").strip()
 
 # Dropbox config
@@ -36,9 +35,9 @@ DROPBOX_MAX_FILES = int(os.getenv("DROPBOX_MAX_FILES", "200"))  # limit listing 
 
 PH_BBOX_DEFAULT = {"lon_min": 115.0, "lon_max": 130.0, "lat_min": 4.0, "lat_max": 22.0}
 
-# -----------------------------
-# Helpers (shared)
-# -----------------------------
+
+# Helpers
+
 def nice_ts(s: str) -> str:
     try:
         s = s.replace("Z", "").strip()
