@@ -184,7 +184,12 @@ def build_event(session, norad, msg_epoch, decay_epoch):
     ts = sf_load.timescale()
     sat = EarthSatellite(l1, l2, f"NORAD {norad}", ts)
 
-    center = dt.datetime.fromisoformat(decay_epoch.replace("Z","+00:00"))
+    center = dt.datetime.fromisoformat(decay_epoch.replace("Z", "+00:00"))
+
+    if center.tzinfo is None:
+        center = center.replace(tzinfo=dt.timezone.utc)
+    else:
+        center = center.astimezone(dt.timezone.utc)
     track = generate_track(sat, center)
 
     min_dist = 1e9
@@ -301,10 +306,30 @@ def monitor_once():
         print("No TIP found.")
         return
 
-    latest = tips[0]
+    # Group by NORAD
+    by_norad = {}
+    for row in tips:
+        norad = int(row["NORAD_CAT_ID"])
+        by_norad.setdefault(norad, []).append(row)
+
+    # Sort each NORAD group by MSG_EPOCH descending
+    latest_objects = []
+
+    for norad, rows in by_norad.items():
+        rows.sort(key=lambda x: x["MSG_EPOCH"], reverse=True)
+        latest_objects.append(rows[0])
+
+    # Sort objects by newest MSG_EPOCH
+    latest_objects.sort(key=lambda x: x["MSG_EPOCH"], reverse=True)
+
+    # Take the most recent decaying object globally
+    latest = latest_objects[0]
+
     norad = int(latest["NORAD_CAT_ID"])
     msg_epoch = latest["MSG_EPOCH"]
     decay_epoch = latest["DECAY_EPOCH"]
+
+    print(f"Latest decaying object: NORAD {norad}")
 
     event_id, event = build_event(session, norad, msg_epoch, decay_epoch)
 
@@ -316,14 +341,6 @@ def monitor_once():
     send_teams(event)
 
     print(f"Processed NORAD {norad} | Severity {event['severity']}")
-
-def monitor_loop():
-    while True:
-        try:
-            monitor_once()
-        except Exception as e:
-            print("Error:", e)
-        time.sleep(MONITOR_INTERVAL)
 
 # ==============================
 # MAIN
