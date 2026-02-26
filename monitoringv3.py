@@ -92,21 +92,35 @@ def viewer_link(event_id):
 def dropbox_upload(local_path, filename):
     import dropbox
     from dropbox.files import WriteMode
+    from requests.exceptions import ReadTimeout
 
     dbx = dropbox.Dropbox(
         oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
         app_key=DROPBOX_APP_KEY,
         app_secret=DROPBOX_APP_SECRET,
+        timeout=300  # increase timeout
     )
 
-    with open(local_path, "rb") as f:
-        dbx.files_upload(
-            f.read(),
-            f"{DROPBOX_FOLDER}/{filename}",
-            mode=WriteMode.overwrite
-        )
+    for attempt in range(3):
+        try:
+            with open(local_path, "rb") as f:
+                dbx.files_upload(
+                    f.read(),
+                    f"{DROPBOX_FOLDER}/{filename}",
+                    mode=WriteMode.overwrite
+                )
+            return f"{DROPBOX_FOLDER}/{filename}"
 
-    return f"{DROPBOX_FOLDER}/{filename}"
+        except ReadTimeout:
+            print(f"Dropbox timeout. Retry {attempt+1}/3...")
+            time.sleep(3)
+
+        except Exception as e:
+            print(f"Dropbox upload failed: {e}")
+            return None
+
+    print("Dropbox upload skipped after retries.")
+    return None
 
 # ==============================
 # SPACE TRACK
@@ -306,41 +320,59 @@ def monitor_once():
         print("No TIP found.")
         return
 
-    # Group by NORAD
+    # Load state
+    state = {}
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+
+    last_seen = state.get("last_msg_epoch", {})
+
+    # Group TIP rows by NORAD
     by_norad = {}
     for row in tips:
         norad = int(row["NORAD_CAT_ID"])
         by_norad.setdefault(norad, []).append(row)
 
-    # Sort each NORAD group by MSG_EPOCH descending
-    latest_objects = []
+    processed_any = False
 
     for norad, rows in by_norad.items():
+        # Sort by newest MSG_EPOCH
         rows.sort(key=lambda x: x["MSG_EPOCH"], reverse=True)
-        latest_objects.append(rows[0])
+        latest = rows[0]
 
-    # Sort objects by newest MSG_EPOCH
-    latest_objects.sort(key=lambda x: x["MSG_EPOCH"], reverse=True)
+        msg_epoch = latest["MSG_EPOCH"]
+        decay_epoch = latest["DECAY_EPOCH"]
 
-    # Take the most recent decaying object globally
-    latest = latest_objects[0]
+        # Skip if already processed
+        if last_seen.get(str(norad)) == msg_epoch:
+            continue
 
-    norad = int(latest["NORAD_CAT_ID"])
-    msg_epoch = latest["MSG_EPOCH"]
-    decay_epoch = latest["DECAY_EPOCH"]
+        print(f"New decay detected → NORAD {norad}")
 
-    print(f"Latest decaying object: NORAD {norad}")
+        event_id, event = build_event(session, norad, msg_epoch, decay_epoch)
 
-    event_id, event = build_event(session, norad, msg_epoch, decay_epoch)
+        path = os.path.join(OUT_DIR, f"{event_id}.json")
+        with open(path, "w") as f:
+            json.dump(event, f, indent=2)
 
-    path = os.path.join(OUT_DIR, f"{event_id}.json")
-    with open(path, "w") as f:
-        json.dump(event, f, indent=2)
+        try:
+            dropbox_upload(path, f"{event_id}.json")
+        except Exception as e:
+            print("Dropbox error (continuing monitoring):", e)
+        send_teams(event)
 
-    dropbox_upload(path, f"{event_id}.json")
-    send_teams(event)
+        last_seen[str(norad)] = msg_epoch
+        processed_any = True
 
-    print(f"Processed NORAD {norad} | Severity {event['severity']}")
+    if processed_any:
+        state["last_msg_epoch"] = last_seen
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+
+        print("State updated.")
+    else:
+        print("No new decays.")
 
 # ==============================
 # MAIN
