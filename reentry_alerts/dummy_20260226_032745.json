@@ -1,0 +1,20 @@
+{
+  "created_utc": "2026-02-26 03:27:45Z",
+  "norad_id": 99999,
+  "object_name": "DUMMY TEST",
+  "tip_msg_epoch_used": "2026-02-26 03:27:45Z",
+  "decay_window": {
+    "start_utc": "2026-02-26 02:57:45Z",
+    "end_utc": "2026-02-26 03:57:45Z",
+    "mode": "dummy"
+  },
+  "hit": {
+    "type": "CROSSES_PH",
+    "time_utc": "2026-02-26 03:27:45Z",
+    "time_ph": "2026-02-26 11:27:45 (PH)",
+    "lat": 14.6,
+    "lon": 120.98,
+    "distance_to_ph_bbox_km": 0.0
+  },
+  "track": []
+}
