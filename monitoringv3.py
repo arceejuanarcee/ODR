@@ -40,7 +40,7 @@ PH_TZ = dt.timezone(dt.timedelta(hours=8))
 PH_BBOX = {"lon_min": 115, "lon_max": 130, "lat_min": 4, "lat_max": 22}
 NEAR_KM = 500
 
-GLOBAL_TIP_LIMIT = 200
+GLOBAL_TIP_LIMIT = 1000
 WINDOW_MIN = 120
 STEP_SECONDS = 30
 MONITOR_INTERVAL = 3600
