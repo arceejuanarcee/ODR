@@ -16,7 +16,7 @@ except Exception:
     ApiError = None
     AuthError = None
 
-# ---- Config
+# Config
 st.set_page_config(page_title="Reentry Event Viewer", layout="wide")
 
 OUT_DIR = os.getenv("OUT_DIR", "./reentry_alerts").strip()
@@ -30,8 +30,8 @@ DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "").strip()
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "").strip()
 DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "").strip()
 
-DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER", "/reentry_alerts").strip()  # where your monitor uploads JSONs
-DROPBOX_MAX_FILES = int(os.getenv("DROPBOX_MAX_FILES", "200"))  # limit listing for performance
+DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER", "/reentry_alerts").strip() 
+DROPBOX_MAX_FILES = int(os.getenv("DROPBOX_MAX_FILES", "200"))
 
 PH_BBOX_DEFAULT = {"lon_min": 115.0, "lon_max": 130.0, "lat_min": 4.0, "lat_max": 22.0}
 
@@ -67,9 +67,7 @@ def split_dateline_segments(points, jump_deg=180.0):
         segs.append(cur)
     return segs
 
-# -----------------------------
-# Local file helpers (fallback)
-# -----------------------------
+# Local helpers
 def load_event_local(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -80,9 +78,7 @@ def list_events_local(out_dir: str) -> List[str]:
     files = [p for p in files if os.path.basename(p).lower() != "state.json"]
     return files
 
-# -----------------------------
-# Dropbox helpers
-# -----------------------------
+#Dropbox helpers
 @st.cache_resource
 def get_dbx(access_token: str, app_key: str, app_secret: str, refresh_token: str):
     """
@@ -205,9 +201,7 @@ def dropbox_download_json(
     except Exception as e:
         raise RuntimeError(f"Failed to download/parse JSON from Dropbox: {e}")
 
-# -----------------------------
 # UI
-# -----------------------------
 st.title("Reentry Event Viewer (PH)")
 
 # Choose source
@@ -317,9 +311,7 @@ else:
     event = load_event_local(event_path)
     event_id = os.path.splitext(os.path.basename(event_path))[0]
 
-# -----------------------------
 # Event summary
-# -----------------------------
 hit = event.get("hit", {}) or {}
 decay = event.get("decay_window", {}) or {}
 ph_bbox = (event.get("ph_filter", {}) or {}).get("bbox", PH_BBOX_DEFAULT)
@@ -349,9 +341,7 @@ with col3:
 
 st.divider()
 
-# -----------------------------
 # Ground track plotting
-# -----------------------------
 track = event.get("track", []) or []
 
 poly = []
