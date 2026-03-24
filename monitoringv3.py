@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#Author: Arcee Juan, SMCOD
 from __future__ import annotations
 
 import os
@@ -13,9 +13,6 @@ import requests
 from dotenv import load_dotenv
 from skyfield.api import EarthSatellite, load as sf_load
 
-# ==============================
-# LOAD ENV
-# ==============================
 
 load_dotenv()
 
@@ -23,7 +20,7 @@ SPACE_TRACK_USERNAME = os.getenv("SPACE_TRACK_USERNAME")
 SPACE_TRACK_PASSWORD = os.getenv("SPACE_TRACK_PASSWORD")
 
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
-VIEWER_BASE_URL = os.getenv("VIEWER_BASE_URL")  # REQUIRED
+VIEWER_BASE_URL = os.getenv("VIEWER_BASE_URL") 
 
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
@@ -45,9 +42,7 @@ WINDOW_MIN = 120
 STEP_SECONDS = 30
 MONITOR_INTERVAL = 3600
 
-# ==============================
-# UTILS
-# ==============================
+# Utility functions
 
 def ensure_dir():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -85,9 +80,7 @@ def viewer_link(event_id):
         return ""
     return f"{VIEWER_BASE_URL.rstrip('/')}/?event_id={event_id}"
 
-# ==============================
-# DROPBOX
-# ==============================
+# Dropbox function
 
 def dropbox_upload(local_path, filename):
     import dropbox
@@ -122,9 +115,7 @@ def dropbox_upload(local_path, filename):
     print("Dropbox upload skipped after retries.")
     return None
 
-# ==============================
-# SPACE TRACK
-# ==============================
+# Space-track functions
 
 def login():
     s = requests.Session()
@@ -165,9 +156,7 @@ def fetch_tle(session, norad):
     lines = [l.strip() for l in r.text.splitlines() if l.strip()]
     return lines[-2], lines[-1]
 
-# ==============================
-# GROUND TRACK
-# ==============================
+# Ground track generation
 
 def generate_track(sat, center_time):
     ts = sf_load.timescale()
@@ -189,9 +178,7 @@ def generate_track(sat, center_time):
         })
     return track
 
-# ==============================
-# BUILD EVENT
-# ==============================
+# Build event data structure
 
 def build_event(session, norad, msg_epoch, decay_epoch):
     l1, l2 = fetch_tle(session, norad)
@@ -246,9 +233,7 @@ def build_event(session, norad, msg_epoch, decay_epoch):
 
     return event_id, event
 
-# ==============================
-# TEAMS
-# ==============================
+# Teams notification
 
 def send_teams(event):
     if not TEAMS_WEBHOOK_URL:
@@ -257,9 +242,7 @@ def send_teams(event):
     payload = event.copy()
     requests.post(TEAMS_WEBHOOK_URL, json=payload)
 
-# ==============================
-# DUMMY
-# ==============================
+# Dummy alert for testing
 
 def dummy_alert():
     ensure_dir()
@@ -307,9 +290,7 @@ def dummy_alert():
 
     print("Dummy alert created with FULL ground track.")
 
-# ==============================
-# MONITOR
-# ==============================
+# Monitoring loop
 
 def monitor_once():
     ensure_dir()
@@ -374,9 +355,7 @@ def monitor_once():
     else:
         print("No new decays.")
 
-# ==============================
-# MAIN
-# ==============================
+# Main
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
